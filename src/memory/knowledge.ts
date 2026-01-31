@@ -295,6 +295,13 @@ function generateLearningsContent(facts: Fact[], unparsed: string[]): string {
     const categoryFacts = byCategory.get(category);
     if (categoryFacts) {
       categoryFacts.push(fact);
+    } else {
+      // Preserve facts with unknown categories by mapping to General
+      // This prevents data loss during regeneration
+      const generalFacts = byCategory.get('General');
+      if (generalFacts) {
+        generalFacts.push(fact);
+      }
     }
   }
 
@@ -330,6 +337,13 @@ function generateLearningsContent(facts: Fact[], unparsed: string[]): string {
 
 /**
  * Escribe learnings.md de forma atómica (temp → rename).
+ *
+ * Concurrency assumptions:
+ * - This function MUST be called within withLock() for single-process safety.
+ * - Multi-process safety is NOT guaranteed. If multiple Node processes write
+ *   concurrently, data loss may occur despite atomic rename.
+ * - For multi-process scenarios, an external lock mechanism (e.g., lockfile,
+ *   flock) would be required.
  */
 async function writeLearningsAtomic(facts: Fact[], unparsed: string[]): Promise<void> {
   const content = generateLearningsContent(facts, unparsed);

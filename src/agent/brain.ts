@@ -76,7 +76,8 @@ export class Brain {
     const execContext: ToolExecutionContext = createExecutionContext();
     notifyToolsTurnStart();
 
-    const isProactiveMode = !options.userInput;
+    // Only undefined/null triggers proactive mode, not empty string
+    const isProactiveMode = options.userInput == null;
     logger.debug('Starting new turn', {
       turnId: execContext.turnId,
       mode: isProactiveMode ? 'proactive' : 'reactive',
@@ -214,7 +215,13 @@ export class Brain {
     }
 
     logger.warn(`Max tool iterations (${this.maxToolIterations}) reached`);
-    return 'Lo siento, no pude completar la tarea. Llegué al límite de iteraciones.';
+    const maxIterationsContent = 'Lo siento, no pude completar la tarea. Llegué al límite de iteraciones.';
+    const assistantMessage: AssistantMessage = {
+      role: 'assistant',
+      content: maxIterationsContent,
+    };
+    saveMessage(assistantMessage);
+    return maxIterationsContent;
   }
 
   getHistory(): Message[] {
