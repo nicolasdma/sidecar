@@ -87,7 +87,16 @@ export function parseFact(line: string, category: string = 'General'): Fact | nu
     return null;
   }
 
-  const [, weightStr, text, learned, confirmed] = match;
+  const weightStr = match[1];
+  const text = match[2];
+  const learned = match[3];
+  const confirmed = match[4];
+
+  // Verificar que todos los grupos existen
+  if (!weightStr || !text || !learned || !confirmed) {
+    return null;
+  }
+
   const weight = parseInt(weightStr, 10);
 
   // Validaciones
@@ -124,7 +133,7 @@ export function parseLearningsFile(content: string): ParseResult {
   let currentCategory = 'General';
 
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
+    const line = lines[i] ?? '';
     const trimmed = line.trim();
     const lineNum = i + 1;
 
@@ -135,7 +144,7 @@ export function parseLearningsFile(content: string): ParseResult {
 
     // Header de categoría
     const categoryMatch = trimmed.match(CATEGORY_REGEX);
-    if (categoryMatch) {
+    if (categoryMatch && categoryMatch[1]) {
       const categoryName = categoryMatch[1].trim();
       if (VALID_CATEGORIES.includes(categoryName as FactCategory)) {
         currentCategory = categoryName;
@@ -174,7 +183,8 @@ export function formatFact(fact: Fact): string {
  * Obtiene la fecha actual en formato YYYY-MM-DD.
  */
 export function getTodayDate(): string {
-  return new Date().toISOString().split('T')[0];
+  const date = new Date().toISOString().split('T')[0];
+  return date ?? new Date().toISOString().slice(0, 10);
 }
 
 /**

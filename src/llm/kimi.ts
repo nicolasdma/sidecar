@@ -54,6 +54,73 @@ const RETRY_DELAYS = [1000, 2000, 4000];
 const RETRYABLE_STATUS_CODES = [429, 500, 502, 503, 504];
 const REQUEST_TIMEOUT_MS = 60000;
 
+// Precios Kimi K2.5 (USD por millón de tokens)
+const PRICING = {
+  input: 0.60,   // $0.60 per 1M input tokens
+  output: 2.50,  // $2.50 per 1M output tokens
+};
+
+/**
+ * Acumulador de costos de la sesión.
+ */
+interface SessionStats {
+  totalRequests: number;
+  totalPromptTokens: number;
+  totalCompletionTokens: number;
+  totalCostUSD: number;
+}
+
+const sessionStats: SessionStats = {
+  totalRequests: 0,
+  totalPromptTokens: 0,
+  totalCompletionTokens: 0,
+  totalCostUSD: 0,
+};
+
+/**
+ * Calcula el costo de una request en USD.
+ */
+function calculateCost(promptTokens: number, completionTokens: number): {
+  inputCost: number;
+  outputCost: number;
+  totalCost: number;
+} {
+  const inputCost = (promptTokens / 1_000_000) * PRICING.input;
+  const outputCost = (completionTokens / 1_000_000) * PRICING.output;
+  return {
+    inputCost,
+    outputCost,
+    totalCost: inputCost + outputCost,
+  };
+}
+
+/**
+ * Actualiza las estadísticas de la sesión.
+ */
+function updateSessionStats(promptTokens: number, completionTokens: number, cost: number): void {
+  sessionStats.totalRequests++;
+  sessionStats.totalPromptTokens += promptTokens;
+  sessionStats.totalCompletionTokens += completionTokens;
+  sessionStats.totalCostUSD += cost;
+}
+
+/**
+ * Obtiene las estadísticas de la sesión actual.
+ */
+export function getSessionStats(): SessionStats {
+  return { ...sessionStats };
+}
+
+/**
+ * Resetea las estadísticas de la sesión.
+ */
+export function resetSessionStats(): void {
+  sessionStats.totalRequests = 0;
+  sessionStats.totalPromptTokens = 0;
+  sessionStats.totalCompletionTokens = 0;
+  sessionStats.totalCostUSD = 0;
+}
+
 async function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -181,8 +248,19 @@ async function makeRequest(
   }
 
   const data = await response.json() as KimiChatResponse;
-  logger.debug('Response received', {
-    usage: data.usage,
+
+  // Calcular y loggear costo
+  const cost = calculateCost(data.usage.prompt_tokens, data.usage.completion_tokens);
+
+  // Actualizar estadísticas de sesión
+  updateSessionStats(data.usage.prompt_tokens, data.usage.completion_tokens, cost.totalCost);
+
+  logger.info('LLM response', {
+    promptTokens: data.usage.prompt_tokens,
+    completionTokens: data.usage.completion_tokens,
+    totalTokens: data.usage.total_tokens,
+    cost: `$${cost.totalCost.toFixed(6)}`,
+    sessionCost: `$${sessionStats.totalCostUSD.toFixed(6)}`,
     finishReason: data.choices[0]?.finish_reason,
   });
 

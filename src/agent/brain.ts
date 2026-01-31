@@ -3,6 +3,7 @@ import { createKimiClient } from '../llm/kimi.js';
 import { buildSystemPrompt } from './prompt-builder.js';
 import { truncateMessages } from './context-guard.js';
 import { getToolDefinitions, executeTool, initializeTools, type ToolResult } from '../tools/index.js';
+import { resetTurnContext } from '../tools/remember.js';
 import { saveMessage, loadHistory } from '../memory/store.js';
 import { createLogger } from '../utils/logger.js';
 
@@ -37,6 +38,9 @@ export class Brain {
   async think(userInput: string): Promise<string> {
     this.initialize();
 
+    // Reset turn context for rate limiting (Bug 9: max 3 remember() per turn)
+    resetTurnContext();
+
     const userMessage: UserMessage = {
       role: 'user',
       content: userInput,
@@ -47,7 +51,7 @@ export class Brain {
 
     const { messages: truncatedHistory } = truncateMessages(history, this.maxContextTokens);
 
-    const systemPrompt = buildSystemPrompt();
+    const systemPrompt = await buildSystemPrompt();
     const tools = getToolDefinitions();
 
     let workingMessages: Message[] = [...truncatedHistory];
