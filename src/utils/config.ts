@@ -48,6 +48,13 @@ function getEnvVar(name: string, required: boolean = false): string | undefined 
   return value;
 }
 
+/**
+ * Issue #5: Centralized paths configuration.
+ * All file paths should be imported from here, not hardcoded.
+ */
+const dataDir = process.env.SIDECAR_DATA_DIR || join(projectRoot, 'data');
+const knowledgeDir = join(dataDir, 'knowledge');
+
 export const config = {
   kimi: {
     apiKey: getEnvVar('KIMI_API_KEY'),
@@ -62,8 +69,16 @@ export const config = {
   },
   paths: {
     root: projectRoot,
-    data: join(projectRoot, 'data'),
+    data: dataDir,
     soul: join(projectRoot, 'SOUL.md'),
+    // Issue #5: Knowledge files
+    knowledge: knowledgeDir,
+    userMd: join(knowledgeDir, 'user.md'),
+    learningsMd: join(knowledgeDir, 'learnings.md'),
+    // Issue #5: Truncated messages backup
+    truncatedMessages: join(dataDir, 'truncated_messages.jsonl'),
+    // Database
+    database: join(dataDir, 'memory.db'),
   },
 } as const;
 

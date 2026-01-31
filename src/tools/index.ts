@@ -1,4 +1,10 @@
-import { registerTool, getToolDefinitions, executeTool } from './registry.js';
+import {
+  registerTool,
+  getToolDefinitions,
+  executeTool,
+  notifyToolsTurnStart,
+  createExecutionContext,
+} from './registry.js';
 import { timeTool } from './time.js';
 import { searchTool } from './search.js';
 import { rememberTool } from './remember.js';
@@ -13,5 +19,10 @@ export function initializeTools(): void {
   registerTool(weatherTool);
 }
 
-export { getToolDefinitions, executeTool };
-export type { Tool, ToolResult } from './types.js';
+export {
+  getToolDefinitions,
+  executeTool,
+  notifyToolsTurnStart,
+  createExecutionContext,
+};
+export type { Tool, ToolResult, ToolExecutionContext } from './types.js';

@@ -8,8 +8,9 @@
 
 import { readFile, writeFile, rename, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
-import path from 'path';
 import { createLogger } from '../utils/logger.js';
+import { config } from '../utils/config.js';
+import { estimateTokens, TOKEN_BUDGETS } from '../utils/tokens.js';
 import { withLock } from '../utils/file-mutex.js';
 import {
   type Fact,
@@ -26,11 +27,10 @@ import { extractSignificantWords } from './stopwords.js';
 
 const log = createLogger('knowledge');
 
-// Paths
-const DATA_DIR = path.join(process.cwd(), 'data');
-const KNOWLEDGE_DIR = path.join(DATA_DIR, 'knowledge');
-const USER_MD_PATH = path.join(KNOWLEDGE_DIR, 'user.md');
-const LEARNINGS_MD_PATH = path.join(KNOWLEDGE_DIR, 'learnings.md');
+// Issue #5: Use centralized paths from config
+const KNOWLEDGE_DIR = config.paths.knowledge;
+const USER_MD_PATH = config.paths.userMd;
+const LEARNINGS_MD_PATH = config.paths.learningsMd;
 
 // Thresholds para deduplicación (Bug 11)
 const DEDUP_THRESHOLD_DEFAULT = 0.70;  // 70% word overlap
@@ -110,10 +110,11 @@ export async function loadKnowledge(): Promise<string> {
 /**
  * Formatea facts para incluir en el prompt.
  * Ordena por score y trunca si es necesario.
+ * Issue #6: Uses centralized token estimation.
  */
 export function formatLearningsForPrompt(
   facts: Fact[],
-  maxTokens: number = 600
+  maxTokens: number = TOKEN_BUDGETS.MAX_LEARNINGS_TOKENS
 ): string {
   if (facts.length === 0) {
     return '';
@@ -126,8 +127,7 @@ export function formatLearningsForPrompt(
   // Ordenar otros por score (mayor primero - Bug 1)
   otherFacts.sort((a, b) => calculateScore(b) - calculateScore(a));
 
-  // Estimar tokens (4 chars/token aprox)
-  const estimateTokens = (text: string) => Math.ceil(text.length / 4);
+  // Issue #6: Use centralized token estimation
 
   // Siempre incluir Health
   const healthLines = healthFacts.map(f => `- ${f.text}`);

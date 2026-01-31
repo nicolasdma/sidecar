@@ -3,46 +3,31 @@
  *
  * Protege contra overflow del context window truncando mensajes viejos.
  * Implementa Bug 12: detección de facts potenciales antes de truncar.
+ * Issue #3: Backup is synchronous to prevent silent data loss.
  */
 
 import { appendFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
-import path from 'path';
 import type { Message } from '../llm/types.js';
 import { createLogger } from '../utils/logger.js';
+import { config } from '../utils/config.js';
+import {
+  estimateMessageTokens,
+  estimateTotalTokens,
+  TOKEN_BUDGETS,
+} from '../utils/tokens.js';
 import { scanMessagesForFacts, type ScanResult } from '../memory/fact-patterns.js';
 
 const logger = createLogger('context');
 
-const APPROX_CHARS_PER_TOKEN = 4;
-const DEFAULT_MAX_TOKENS = 100000;
-const SYSTEM_PROMPT_RESERVE = 4000;
-const RESPONSE_RESERVE = 4000;
+// Issue #6: Use centralized token constants
+const DEFAULT_MAX_TOKENS = TOKEN_BUDGETS.DEFAULT_MAX_CONTEXT;
+const SYSTEM_PROMPT_RESERVE = TOKEN_BUDGETS.SYSTEM_PROMPT_RESERVE;
+const RESPONSE_RESERVE = TOKEN_BUDGETS.RESPONSE_RESERVE;
 
-// Path para backup de mensajes truncados (Bug 12)
-const DATA_DIR = path.join(process.cwd(), 'data');
-const TRUNCATED_MESSAGES_PATH = path.join(DATA_DIR, 'truncated_messages.jsonl');
-
-function estimateTokens(text: string | null): number {
-  if (!text) return 0;
-  return Math.ceil(text.length / APPROX_CHARS_PER_TOKEN);
-}
-
-function estimateMessageTokens(message: Message): number {
-  let tokens = estimateTokens(message.content);
-
-  tokens += 4;
-
-  if (message.role === 'assistant' && message.tool_calls) {
-    tokens += estimateTokens(JSON.stringify(message.tool_calls));
-  }
-
-  return tokens;
-}
-
-function estimateTotalTokens(messages: Message[]): number {
-  return messages.reduce((sum, msg) => sum + estimateMessageTokens(msg), 0);
-}
+// Issue #5: Use centralized paths from config
+const DATA_DIR = config.paths.data;
+const TRUNCATED_MESSAGES_PATH = config.paths.truncatedMessages;
 
 export interface ContextGuardResult {
   messages: Message[];
@@ -51,53 +36,54 @@ export interface ContextGuardResult {
   finalCount: number;
   estimatedTokens: number;
   potentialFactsWarning?: string;
+  /** Issue #3: Indicates if backup of truncated messages failed */
+  backupFailed?: boolean;
 }
 
 /**
  * Guarda mensajes truncados en archivo de backup (Bug 12).
  * Este backup es append-only y sirve para recovery manual.
+ *
+ * Issue #3: Now throws errors instead of swallowing them,
+ * so callers can detect backup failures.
  */
 async function backupTruncatedMessages(
   messages: Message[],
   scanResult: ScanResult
 ): Promise<void> {
-  try {
-    // Asegurar que existe el directorio
-    if (!existsSync(DATA_DIR)) {
-      await mkdir(DATA_DIR, { recursive: true });
-    }
-
-    const entry = {
-      timestamp: new Date().toISOString(),
-      messageCount: messages.length,
-      potentialFacts: scanResult.matches,
-      messages: messages.map(m => ({
-        role: m.role,
-        content: m.content?.slice(0, 500), // Limitar tamaño del backup
-      })),
-    };
-
-    await appendFile(
-      TRUNCATED_MESSAGES_PATH,
-      JSON.stringify(entry) + '\n',
-      'utf-8'
-    );
-
-    logger.debug('Mensajes truncados guardados en backup');
-  } catch (error) {
-    logger.error('Error guardando backup de mensajes truncados', { error });
-    // No propagar el error - el backup es best-effort
+  // Asegurar que existe el directorio
+  if (!existsSync(DATA_DIR)) {
+    await mkdir(DATA_DIR, { recursive: true });
   }
+
+  const entry = {
+    timestamp: new Date().toISOString(),
+    messageCount: messages.length,
+    potentialFacts: scanResult.matches,
+    messages: messages.map(m => ({
+      role: m.role,
+      content: m.content?.slice(0, 500), // Limitar tamaño del backup
+    })),
+  };
+
+  await appendFile(
+    TRUNCATED_MESSAGES_PATH,
+    JSON.stringify(entry) + '\n',
+    'utf-8'
+  );
+
+  logger.debug('Mensajes truncados guardados en backup');
 }
 
 /**
  * Trunca mensajes para que quepan en el context window.
  * Implementa Bug 12: detección y backup de facts potenciales.
+ * Issue #3: Backup is now synchronous to prevent silent data loss.
  */
-export function truncateMessages(
+export async function truncateMessages(
   messages: Message[],
   maxTokens: number = DEFAULT_MAX_TOKENS
-): ContextGuardResult {
+): Promise<ContextGuardResult> {
   const availableTokens = maxTokens - SYSTEM_PROMPT_RESERVE - RESPONSE_RESERVE;
 
   const totalTokens = estimateTotalTokens(messages);
@@ -148,6 +134,7 @@ export function truncateMessages(
 
   // Bug 12: Escanear mensajes removidos por facts potenciales
   let potentialFactsWarning: string | undefined;
+  let backupFailed = false;
 
   if (removedMessages.length > 0) {
     const scanResult = scanMessagesForFacts(removedMessages);
@@ -166,10 +153,15 @@ export function truncateMessages(
         logger.warn(`  - [${match.priority}] ${match.category}: "${match.excerpt}"`);
       }
 
-      // Guardar backup de forma asíncrona (no bloquear)
-      backupTruncatedMessages(removedMessages, scanResult).catch(err => {
-        logger.error('Error en backup asíncrono', { error: err });
-      });
+      // Issue #3: Guardar backup de forma síncrona (bloquea hasta completar)
+      try {
+        await backupTruncatedMessages(removedMessages, scanResult);
+      } catch (error) {
+        logger.error('CRÍTICO: Falló backup de mensajes con facts potenciales', { error });
+        backupFailed = true;
+        // Update warning to include backup failure
+        potentialFactsWarning = `⚠️ ALERTA: ${scanResult.matches.length} facts potenciales NO pudieron respaldarse (backup failed)`;
+      }
     }
   }
 
@@ -180,6 +172,7 @@ export function truncateMessages(
     finalCount: truncated.length,
     estimatedTokens: currentTokens,
     potentialFactsWarning,
+    backupFailed,
   };
 }
 

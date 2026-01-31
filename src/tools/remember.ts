@@ -3,40 +3,20 @@
  *
  * Permite al agente guardar información importante sobre el usuario
  * en la memoria persistente (learnings.md).
+ *
+ * Issue #1: Uses ToolExecutionContext passed explicitly instead of global state.
  */
 
-import type { Tool, ToolResult } from './types.js';
+import type { Tool, ToolResult, ToolExecutionContext } from './types.js';
+import { getToolCallCount, incrementToolCallCount } from './types.js';
 import { rememberFact, type RememberResult } from '../memory/knowledge.js';
 import { VALID_CATEGORIES } from '../memory/fact-parser.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('tool:remember');
 
-/**
- * Contexto del turno actual para tracking de rate limit.
- * Se resetea al inicio de cada turno del agentic loop.
- */
-export interface TurnContext {
-  rememberCount: number;
-}
-
-// Contexto global del turno actual (se resetea desde brain.ts)
-let currentTurnContext: TurnContext = { rememberCount: 0 };
-
-/**
- * Resetea el contexto del turno.
- * Debe llamarse al inicio de cada turno del agentic loop.
- */
-export function resetTurnContext(): void {
-  currentTurnContext = { rememberCount: 0 };
-}
-
-/**
- * Obtiene el contexto del turno actual.
- */
-export function getTurnContext(): TurnContext {
-  return currentTurnContext;
-}
+/** Maximum number of remember_fact calls allowed per turn (Bug 9 mitigation) */
+const MAX_REMEMBER_PER_TURN = 3;
 
 /**
  * Tool definition para remember_fact.
@@ -70,7 +50,10 @@ Si no guardás la información, la vas a olvidar en futuras conversaciones.`,
     required: ['fact', 'category'],
   },
 
-  execute: async (args: Record<string, unknown>): Promise<ToolResult> => {
+  execute: async (
+    args: Record<string, unknown>,
+    context?: ToolExecutionContext
+  ): Promise<ToolResult> => {
     const fact = args.fact as string;
     const category = args.category as string;
 
@@ -90,23 +73,41 @@ Si no guardás la información, la vas a olvidar en futuras conversaciones.`,
       };
     }
 
+    // Issue #1: Use passed context for rate limiting instead of global state
+    const currentCount = context ? getToolCallCount(context, 'remember_fact') : 0;
+
     log.info(`remember_fact llamado`, {
       fact: fact.slice(0, 50),
       category,
-      turnCount: currentTurnContext.rememberCount,
+      turnCount: currentCount,
+      turnId: context?.turnId,
     });
+
+    // Issue #1 + Bug 9: Check rate limit using context
+    if (currentCount >= MAX_REMEMBER_PER_TURN) {
+      log.warn(`Rate limit reached: ${MAX_REMEMBER_PER_TURN} remember_fact calls per turn`, {
+        turnId: context?.turnId,
+      });
+      return {
+        success: false,
+        data: null,
+        error: `Límite alcanzado: máximo ${MAX_REMEMBER_PER_TURN} facts por turno de conversación`,
+      };
+    }
 
     try {
       const result: RememberResult = await rememberFact(
         fact.trim(),
         category,
-        currentTurnContext.rememberCount
+        currentCount
       );
 
-      // Incrementar contador del turno (para rate limit - Bug 9)
-      currentTurnContext.rememberCount++;
+      // Increment counter in context (for rate limit - Bug 9)
+      if (context) {
+        incrementToolCallCount(context, 'remember_fact');
+      }
 
-      // Formatear respuesta según acción
+      // Format response based on action
       switch (result.action) {
         case 'created':
           return {
@@ -147,7 +148,7 @@ Si no guardás la información, la vas a olvidar en futuras conversaciones.`,
           return {
             success: false,
             data: null,
-            error: 'Límite alcanzado: máximo 3 facts por turno de conversación',
+            error: `Límite alcanzado: máximo ${MAX_REMEMBER_PER_TURN} facts por turno de conversación`,
           };
 
         default:

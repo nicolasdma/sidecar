@@ -1,6 +1,5 @@
 import Database from 'better-sqlite3';
 import { existsSync, mkdirSync } from 'fs';
-import { join } from 'path';
 import type { Message, ToolCall } from '../llm/types.js';
 import { config } from '../utils/config.js';
 import { createLogger } from '../utils/logger.js';
@@ -30,9 +29,33 @@ interface MessageRow {
 
 let db: Database.Database | null = null;
 
+/**
+ * Issue #10: Simple health check to verify SQLite connection is functional.
+ */
+function isConnectionHealthy(database: Database.Database): boolean {
+  try {
+    database.prepare('SELECT 1').get();
+    return true;
+  } catch (error) {
+    logger.warn('SQLite connection unhealthy', { error });
+    return false;
+  }
+}
+
 function getDatabase(): Database.Database {
+  // Issue #10: Check if existing connection is healthy
   if (db) {
-    return db;
+    if (isConnectionHealthy(db)) {
+      return db;
+    }
+    // Connection is unhealthy, close and reconnect
+    logger.warn('SQLite connection failed health check, reconnecting...');
+    try {
+      db.close();
+    } catch {
+      // Ignore close errors
+    }
+    db = null;
   }
 
   const dataDir = config.paths.data;
@@ -41,7 +64,8 @@ function getDatabase(): Database.Database {
     logger.info(`Created data directory: ${dataDir}`);
   }
 
-  const dbPath = join(dataDir, 'memory.db');
+  // Issue #5: Use centralized path from config
+  const dbPath = config.paths.database;
   db = new Database(dbPath);
   db.exec(SCHEMA);
 
@@ -109,8 +133,15 @@ export function loadHistory(limit: number = 50): Message[] {
       if (row.tool_calls) {
         try {
           (msg as { tool_calls?: ToolCall[] }).tool_calls = JSON.parse(row.tool_calls) as ToolCall[];
-        } catch {
-          logger.warn('Failed to parse tool_calls JSON');
+        } catch (error) {
+          // Issue #11: Make corrupted JSON visible instead of silently ignoring
+          logger.error('CRÍTICO: tool_calls JSON corrupto en DB', {
+            messageId: row.id,
+            raw: row.tool_calls.slice(0, 100),
+            error,
+          });
+          // Mark the message content to indicate corruption
+          msg.content = `[ERROR: tool_calls corrupto - id:${row.id}] ${msg.content || ''}`;
         }
       }
 

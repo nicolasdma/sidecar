@@ -2,8 +2,15 @@ import type { Message, AssistantMessage, ToolMessage, UserMessage, LLMClient } f
 import { createKimiClient } from '../llm/kimi.js';
 import { buildSystemPrompt } from './prompt-builder.js';
 import { truncateMessages } from './context-guard.js';
-import { getToolDefinitions, executeTool, initializeTools, type ToolResult } from '../tools/index.js';
-import { resetTurnContext } from '../tools/remember.js';
+import {
+  getToolDefinitions,
+  executeTool,
+  initializeTools,
+  createExecutionContext,
+  notifyToolsTurnStart,
+  type ToolResult,
+  type ToolExecutionContext,
+} from '../tools/index.js';
 import { saveMessage, loadHistory } from '../memory/store.js';
 import { createLogger } from '../utils/logger.js';
 
@@ -14,6 +21,18 @@ const MAX_TOOL_ITERATIONS = 10;
 interface BrainConfig {
   maxToolIterations?: number;
   maxContextTokens?: number;
+}
+
+/**
+ * Issue #7: Options for think() to support both reactive and proactive modes.
+ */
+export interface ThinkOptions {
+  /** User input message. Optional for proactive mode. */
+  userInput?: string;
+  /** Additional context for proactive messages (e.g., "morning check-in") */
+  proactiveContext?: string;
+  /** Whether to save the user message (default: true if userInput provided) */
+  saveUserMessage?: boolean;
 }
 
 export class Brain {
@@ -35,26 +54,71 @@ export class Brain {
     logger.info('Brain initialized');
   }
 
-  async think(userInput: string): Promise<string> {
+  /**
+   * Main thinking method. Processes input and generates a response.
+   *
+   * Issue #7: Accepts either a string (backward compatible) or ThinkOptions
+   * to support proactive mode where no user input is needed.
+   *
+   * @param optionsOrInput - User input string or ThinkOptions object
+   * @returns The assistant's response
+   */
+  async think(optionsOrInput: string | ThinkOptions): Promise<string> {
     this.initialize();
 
-    // Reset turn context for rate limiting (Bug 9: max 3 remember() per turn)
-    resetTurnContext();
+    // Issue #7: Normalize input to ThinkOptions for unified handling
+    const options: ThinkOptions = typeof optionsOrInput === 'string'
+      ? { userInput: optionsOrInput }
+      : optionsOrInput;
 
-    const userMessage: UserMessage = {
-      role: 'user',
-      content: userInput,
-    };
-    saveMessage(userMessage);
+    // Issue #1: Create fresh execution context for this turn
+    // Issue #4: Notify all tools of turn start via registry hook
+    const execContext: ToolExecutionContext = createExecutionContext();
+    notifyToolsTurnStart();
+
+    const isProactiveMode = !options.userInput;
+    logger.debug('Starting new turn', {
+      turnId: execContext.turnId,
+      mode: isProactiveMode ? 'proactive' : 'reactive',
+      proactiveContext: options.proactiveContext,
+    });
+
+    // Issue #7: Only save user message if there's actual user input
+    if (options.userInput) {
+      const shouldSave = options.saveUserMessage !== false;
+      if (shouldSave) {
+        const userMessage: UserMessage = {
+          role: 'user',
+          content: options.userInput,
+        };
+        saveMessage(userMessage);
+      }
+    }
 
     let history = loadHistory();
 
-    const { messages: truncatedHistory } = truncateMessages(history, this.maxContextTokens);
+    // Issue #3: truncateMessages is now async to ensure backup completes
+    const { messages: truncatedHistory, backupFailed } = await truncateMessages(history, this.maxContextTokens);
+
+    if (backupFailed) {
+      logger.warn('Backup of truncated messages failed - potential data loss');
+    }
 
     const systemPrompt = await buildSystemPrompt();
     const tools = getToolDefinitions();
 
+    // Issue #7: For proactive mode, add context as a system-style message
     let workingMessages: Message[] = [...truncatedHistory];
+
+    if (isProactiveMode && options.proactiveContext) {
+      // Add proactive context as a user message that won't be saved
+      const contextMessage: UserMessage = {
+        role: 'user',
+        content: `[Sistema: ${options.proactiveContext}]`,
+      };
+      workingMessages.push(contextMessage);
+    }
+
     let iterations = 0;
 
     while (iterations < this.maxToolIterations) {
@@ -98,12 +162,13 @@ export class Brain {
         saveMessage(assistantMessage);
 
         for (const toolCall of response.toolCalls) {
-          logger.info(`Tool call: ${toolCall.function.name}`);
+          logger.info(`Tool call: ${toolCall.function.name}`, { turnId: execContext.turnId });
 
           let result: ToolResult;
           try {
             const args = JSON.parse(toolCall.function.arguments) as Record<string, unknown>;
-            result = await executeTool(toolCall.function.name, args);
+            // Issue #1: Pass execution context to tools
+            result = await executeTool(toolCall.function.name, args, execContext);
           } catch (parseError) {
             logger.error('Failed to parse tool arguments', toolCall.function.arguments);
             result = {
@@ -155,6 +220,35 @@ export class Brain {
   getHistory(): Message[] {
     return loadHistory();
   }
+
+  /**
+   * Issue #7: Initiate a proactive message without user input.
+   * Used by the proactive loop in Fase 3.
+   *
+   * @param context - Context for why the agent is initiating (e.g., "morning greeting", "reminder check")
+   * @returns The agent's proactive message, or null if the agent decides not to speak
+   */
+  async initiateProactive(context: string): Promise<string | null> {
+    logger.info('Initiating proactive message', { context });
+
+    try {
+      const response = await this.think({
+        proactiveContext: context,
+        saveUserMessage: false,
+      });
+
+      // If the response is essentially empty or a refusal, return null
+      if (!response || response.trim().length === 0) {
+        logger.debug('Proactive initiation returned empty response');
+        return null;
+      }
+
+      return response;
+    } catch (error) {
+      logger.error('Error in proactive initiation', { error, context });
+      return null;
+    }
+  }
 }
 
 let brainInstance: Brain | null = null;
@@ -166,7 +260,15 @@ export function getBrain(): Brain {
   return brainInstance;
 }
 
-export async function think(userInput: string): Promise<string> {
+export async function think(optionsOrInput: string | ThinkOptions): Promise<string> {
   const brain = getBrain();
-  return brain.think(userInput);
+  return brain.think(optionsOrInput);
+}
+
+/**
+ * Issue #7: Initiate a proactive message.
+ */
+export async function initiateProactive(context: string): Promise<string | null> {
+  const brain = getBrain();
+  return brain.initiateProactive(context);
 }
