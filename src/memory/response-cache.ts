@@ -1,6 +1,20 @@
 /**
  * Fase 3: Response Cache
  *
+ * @deprecated This module is NOT integrated into the main agent flow.
+ * Fase 3.5 (LocalRouter) handles deterministic tool responses via DIRECT_TOOL routing,
+ * which subsumes the primary use case for this cache.
+ *
+ * Decision (Fase 3 Bugfix #2): Deprecate rather than integrate.
+ * Reasons:
+ * 1. LocalRouter covers deterministic tools (time, weather, reminders)
+ * 2. Caching LLM responses has high risk of stale/incorrect answers
+ * 3. The benefit (saved API calls) is outweighed by the complexity
+ *
+ * This code is kept for potential future reactivation but is NOT called from brain.ts.
+ * See: plan/fase-3-bugfix.md for full rationale.
+ *
+ * Original description:
  * Caches LLM responses to avoid redundant API calls for similar queries.
  * Uses embeddings for semantic similarity matching.
  *

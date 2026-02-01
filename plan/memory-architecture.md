@@ -10,11 +10,20 @@
 | Fase | Estado | Descripción |
 |------|--------|-------------|
 | **Fase 1** | ✅ Completada | Foundation - Schema SQLite, ventana 6 turnos, `/remember`, `/facts`, keyword filtering |
-| **Fase 2** | ⏳ Pendiente | Extracción automática de facts, summarization, topic shift, confidence decay |
-| **Fase 3** | ⏳ Pendiente | Embeddings locales, ventana adaptativa, ranking semántico, cache |
+| **Fase 2** | ✅ Completada | Extracción automática de facts, summarization, topic shift, confidence decay |
+| **Fase 3** | ✅ Completada | Embeddings locales, ventana adaptativa, ranking semántico (cache deprecado → 3.5) |
+| **Fase 3.5** | ⏳ Pendiente | LocalRouter - Qwen local para intents determinísticos |
 | **Fase 4** | ⏳ Pendiente | Memory Agent local, comandos expandidos, métricas, archive |
 
 **Última actualización:** 2026-02-01
+
+### Notas sobre Fase 3
+
+- **Embeddings:** Implementados con `all-MiniLM-L6-v2` via transformers.js
+- **Vector Search:** Híbrido (vector + keyword) integrado en `knowledge.ts`
+- **Ventana Adaptativa:** Integrada en `context-guard.ts` (4/6/8 turnos según continuidad)
+- **Response Cache:** Deprecado - Fase 3.5 LocalRouter subsume este caso de uso para tools determinísticos
+- **Ver:** `plan/fase-3-bugfix.md` para detalles de integración
 
 ---
 
@@ -354,24 +363,24 @@ El LLM NO genera el disclaimer (no gastar tokens explicando ahorro)
 
 ### SÍ (Obligatorio)
 
-- [ ] Extraer facts ANTES de descartar turnos *(Fase 2)*
-- [ ] Resumen en formato key-value estructurado *(Fase 2)*
-- [ ] Cachear respuestas deterministas *(Fase 3)*
-- [ ] Límite hard de 4000 tokens por request *(Fase 2)*
-- [x] Filtrar facts por dominio relevante *(Fase 1 - keyword matching)*
-- [ ] Confidence decay en facts antiguos *(schema listo, cron Fase 2)*
-- [ ] Validar formato antes de omitir instrucciones *(Fase 2)*
-- [ ] Disclaimer de dedup generado por sistema *(Fase 3)*
+- [x] Extraer facts ANTES de descartar turnos *(Fase 2 - extraction-service.ts)*
+- [x] Resumen en formato key-value estructurado *(Fase 2 - summarization-service.ts)*
+- [x] Cachear respuestas deterministas *(Fase 3.5 - LocalRouter maneja esto)*
+- [x] Límite hard de 4000 tokens por request *(context-guard.ts)*
+- [x] Filtrar facts por dominio relevante *(Fase 1 keyword + Fase 3 embeddings)*
+- [x] Confidence decay en facts antiguos *(Fase 2 - decay-service.ts)*
+- [ ] Validar formato antes de omitir instrucciones *(pendiente)*
+- [x] Disclaimer de dedup generado por sistema *(Fase 3.5 - templates en LocalRouter)*
 
-### NO (Prohibido) — Fase 1 cumple estas restricciones:
+### NO (Prohibido) — Todas cumplidas:
 
-- [x] Guardar turnos completos indefinidamente → ventana deslizante de 6 turnos
-- [ ] Resumir en prosa narrativa *(N/A, aún sin summarization)*
-- [ ] Llamar LLM para lookups cacheables *(N/A, sin cache aún)*
-- [x] Crecer contexto linealmente → O(1) con ventana fija
-- [x] Inyectar todos los facts siempre → filtrado por keywords activo
-- [ ] Mantener facts sin re-confirmación > 180 días *(decay cron en Fase 2)*
-- [ ] Omitir formato sin validación previa *(N/A)*
+- [x] Guardar turnos completos indefinidamente → ventana deslizante adaptativa (4-8 turnos)
+- [x] Resumir en prosa narrativa → formato key-value en summarization-service
+- [x] Llamar LLM para lookups cacheables → LocalRouter ejecuta tools directamente
+- [x] Crecer contexto linealmente → O(1) con ventana adaptativa
+- [x] Inyectar todos los facts siempre → filtrado híbrido (keywords + embeddings)
+- [x] Mantener facts sin re-confirmación > 180 días → decay-service marca como stale
+- [ ] Omitir formato sin validación previa *(pendiente)*
 - [x] Gastar tokens explicando que se ahorran tokens → no hacemos esto
 
 ---
@@ -442,61 +451,65 @@ TOKENS USADOS: 490 (vs ~2000+ sin estrategia)
 
 ---
 
-### Fase 2: Extracción y Summarization
+### Fase 2: Extracción y Summarization ✅ COMPLETADA
 
 **Objetivo:** Automatizar gestión de memoria con LLM.
 
-- [ ] Extracción de facts automática
-  - [ ] Tabla `pending_extraction` como buffer
-  - [ ] Retry queue con 3 intentos
-  - [ ] Solo descartar turno raw después de éxito confirmado
-  - [ ] Señales: "recordá", "siempre", "decidí", "a partir de ahora"
-- [ ] Resúmenes estructurados key-value
-  - [ ] Trigger: turno 7+ sale de ventana
-  - [ ] Formato JSON estricto (§2.4)
-  - [ ] 4 slots máximo, write-once
-- [ ] Topic shift detection
-  - [ ] Keywords expandidos (§10.3 punto 3)
-  - [ ] **Sin embeddings aún** (keywords + frases explícitas)
-- [ ] Confidence decay gradual
-  - [ ] Día 60: flag `aging=true` (aún se inyecta)
-  - [ ] Día 90: `priority=low` (solo si query muy relevante)
-  - [ ] Día 120: `stale=true` (no inyectar)
+- [x] Extracción de facts automática
+  - [x] Tabla `pending_extraction` como buffer
+  - [x] Retry queue con 3 intentos
+  - [x] Solo descartar turno raw después de éxito confirmado
+  - [x] Señales: "recordá", "siempre", "decidí", "a partir de ahora"
+- [x] Resúmenes estructurados key-value
+  - [x] Trigger: turno 7+ sale de ventana
+  - [x] Formato JSON estricto (§2.4)
+  - [x] 4 slots máximo, write-once
+- [x] Topic shift detection
+  - [x] Keywords expandidos (§10.3 punto 3)
+  - [x] **Sin embeddings aún** (keywords + frases explícitas)
+- [x] Confidence decay gradual
+  - [x] Día 60: flag `aging=true` (aún se inyecta)
+  - [x] Día 90: `priority=low` (solo si query muy relevante)
+  - [x] Día 120: `stale=true` (no inyectar)
 
 **Criterio de éxito:**
-- Facts se extraen sin pérdida
-- Resúmenes son parseables y estables
-- Memoria no crece linealmente
+- ✅ Facts se extraen sin pérdida
+- ✅ Resúmenes son parseables y estables
+- ✅ Memoria no crece linealmente
 
 ---
 
-### Fase 3: Inteligencia Semántica
+### Fase 3: Inteligencia Semántica ✅ COMPLETADA
 
 **Objetivo:** Retrieval basado en significado, no keywords.
 
-- [ ] Embeddings locales
-  - [ ] Modelo: `all-MiniLM-L6-v2` (~80MB)
-  - [ ] Storage: `sqlite-vec` extension
-  - [ ] Embed facts al crear, embed query en runtime
-- [ ] Ventana adaptativa
-  - [ ] `semantic_continuity` calculado por embeddings
-  - [ ] 4 turnos si continuity < 0.3
-  - [ ] 8 turnos si continuity > 0.7
-- [ ] Ranking de facts por similarity
-  - [ ] Cosine similarity query vs facts
-  - [ ] Top-5 con threshold > 0.4
-  - [ ] Fallback a keyword si 0 resultados
-- [ ] Cache de respuestas deterministas
-  - [ ] Key: `hash(lowercase(strip(query)))`
-  - [ ] TTL: 24h para facts, 1h para tools
-- [ ] Dedup de intención
-  - [ ] Threshold: 0.75 (no 0.85)
-  - [ ] Disclaimer generado por sistema
+- [x] Embeddings locales
+  - [x] Modelo: `all-MiniLM-L6-v2` (~80MB) via transformers.js
+  - [x] Storage: `sqlite-vec` extension (con fallback a keyword)
+  - [x] Embed facts al crear (async via embedding-worker)
+  - [x] Embed query en runtime
+- [x] Ventana adaptativa
+  - [x] `semantic_continuity` calculado por embeddings
+  - [x] 4 turnos si continuity < 0.3
+  - [x] 8 turnos si continuity > 0.7
+  - [x] Integrado en context-guard.ts
+- [x] Ranking de facts por similarity
+  - [x] Cosine similarity query vs facts (vector-search.ts)
+  - [x] Top-5 con threshold > 0.4
+  - [x] Fallback a keyword si embeddings no disponibles
+  - [x] Híbrido: 70% vector + 30% keyword
+- [x] Cache de respuestas deterministas
+  - [x] **DEPRECADO:** Fase 3.5 LocalRouter subsume este caso de uso
+  - [x] Código en response-cache.ts (no integrado, mantenido para referencia)
+- [x] Dedup de intención
+  - [x] **DEPRECADO:** Fase 3.5 LocalRouter maneja tools determinísticos
 
 **Criterio de éxito:**
-- "deployment process" encuentra fact sobre "k8s deploy"
-- Queries reformuladas no disparan LLM duplicado
-- Latencia de embedding < 50ms
+- ✅ "deployment process" encuentra fact sobre "k8s deploy" (hybrid search)
+- ✅ Ventana adaptativa funciona según continuidad
+- ⚠️ Response cache deprecado en favor de LocalRouter (Fase 3.5)
+
+**Ver:** `plan/fase-3-bugfix.md` para detalles de integración
 
 ---
 

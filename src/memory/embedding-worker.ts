@@ -64,6 +64,9 @@ export async function startEmbeddingWorker(): Promise<void> {
   // Cleanup old failed items
   cleanupFailedEmbeddings();
 
+  // Fix #4: Cleanup orphan vectors/embeddings for deleted facts
+  cleanupOrphanVectors();
+
   // Queue facts without embeddings
   await queueMissingEmbeddings();
 
@@ -324,4 +327,71 @@ export function enforceEmbeddingQueueLimit(): number {
   }
 
   return result.changes;
+}
+
+/**
+ * Fix #4: Removes vectors and embeddings for facts that no longer exist.
+ * Called periodically to prevent orphan accumulation.
+ *
+ * Note: fact_embeddings has ON DELETE CASCADE but fact_vectors is a sqlite-vec
+ * virtual table that may not support CASCADE, so we clean both explicitly.
+ *
+ * @returns Number of orphan records removed
+ */
+export function cleanupOrphanVectors(): number {
+  if (!isEmbeddingsEnabled()) return 0;
+
+  const database = getDatabase();
+  let totalCleaned = 0;
+
+  // 1. Cleanup orphan fact_embeddings (should be rare due to CASCADE)
+  try {
+    const orphanEmbeddings = database.prepare(`
+      DELETE FROM fact_embeddings
+      WHERE fact_id NOT IN (SELECT id FROM facts)
+    `).run();
+
+    if (orphanEmbeddings.changes > 0) {
+      logger.info('Cleaned up orphan embeddings', { count: orphanEmbeddings.changes });
+      totalCleaned += orphanEmbeddings.changes;
+    }
+  } catch (error) {
+    logger.debug('Orphan embeddings cleanup skipped', {
+      error: error instanceof Error ? error.message : 'Unknown',
+    });
+  }
+
+  // 2. Cleanup orphan fact_vectors (sqlite-vec virtual table)
+  try {
+    // First find orphans
+    const orphans = database.prepare(`
+      SELECT v.fact_id
+      FROM fact_vectors v
+      LEFT JOIN facts f ON v.fact_id = f.id
+      WHERE f.id IS NULL
+    `).all() as Array<{ fact_id: string }>;
+
+    if (orphans.length > 0) {
+      logger.info('Cleaning up orphan vectors', { count: orphans.length });
+
+      for (const { fact_id } of orphans) {
+        try {
+          database.prepare('DELETE FROM fact_vectors WHERE fact_id = ?').run(fact_id);
+          totalCleaned++;
+        } catch (deleteError) {
+          logger.warn('Failed to delete orphan vector', {
+            factId: fact_id,
+            error: deleteError instanceof Error ? deleteError.message : 'Unknown',
+          });
+        }
+      }
+    }
+  } catch (error) {
+    // fact_vectors table might not exist (sqlite-vec not loaded)
+    logger.debug('Orphan vector cleanup skipped (sqlite-vec not available)', {
+      error: error instanceof Error ? error.message : 'Unknown',
+    });
+  }
+
+  return totalCleaned;
 }

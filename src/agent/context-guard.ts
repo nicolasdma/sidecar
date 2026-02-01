@@ -19,6 +19,8 @@ import {
 import { scanMessagesForFacts, type ScanResult } from '../memory/fact-patterns.js';
 import { summarizeMessages } from '../memory/summarization-service.js';
 import { detectTopicShift, shouldTriggerSummarization } from '../memory/topic-detector.js';
+import { getAdaptiveWindowSize } from '../memory/semantic-continuity.js';
+import { isEmbeddingsReady } from '../memory/embeddings-state.js';
 
 const logger = createLogger('context');
 
@@ -26,6 +28,14 @@ const logger = createLogger('context');
 const DEFAULT_MAX_TOKENS = TOKEN_BUDGETS.DEFAULT_MAX_CONTEXT;
 const SYSTEM_PROMPT_RESERVE = TOKEN_BUDGETS.SYSTEM_PROMPT_RESERVE;
 const RESPONSE_RESERVE = TOKEN_BUDGETS.RESPONSE_RESERVE;
+
+// Fase 3 Fix #1: Adaptive window token budgets based on semantic continuity
+// Maps window size (4, 6, 8) to available tokens for conversation
+const ADAPTIVE_WINDOW_TOKENS: Record<number, number> = {
+  4: 1600,  // Low continuity (topic shift) - smaller context
+  6: 2000,  // Default
+  8: 2400,  // High continuity (same topic) - larger context
+};
 
 // Issue #5: Use centralized paths from config
 const DATA_DIR = config.paths.data;
@@ -42,6 +52,8 @@ export interface ContextGuardResult {
   backupFailed?: boolean;
   /** Fase 2: Indicates if a topic shift was detected */
   topicShiftDetected?: boolean;
+  /** Fase 3: Adaptive window size used (4, 6, or 8) */
+  adaptiveWindowSize?: number;
 }
 
 /**
@@ -94,7 +106,24 @@ export async function truncateMessages(
   maxTokens: number = DEFAULT_MAX_TOKENS,
   currentUserMessage?: string
 ): Promise<ContextGuardResult> {
-  const availableTokens = maxTokens - SYSTEM_PROMPT_RESERVE - RESPONSE_RESERVE;
+  // Fase 3 Fix #1: Calculate adaptive window size if embeddings available
+  let adaptiveWindowSize = 6; // default
+  if (currentUserMessage && isEmbeddingsReady()) {
+    try {
+      adaptiveWindowSize = await getAdaptiveWindowSize(currentUserMessage, messages);
+      logger.debug('Adaptive window calculated', { windowSize: adaptiveWindowSize });
+    } catch (error) {
+      logger.debug('Adaptive window calculation failed, using default', {
+        error: error instanceof Error ? error.message : 'Unknown',
+      });
+    }
+  }
+
+  // Use adaptive token budget based on semantic continuity
+  const adaptiveTokenBudget = ADAPTIVE_WINDOW_TOKENS[adaptiveWindowSize] ?? 2000;
+  const baseAvailable = maxTokens - SYSTEM_PROMPT_RESERVE - RESPONSE_RESERVE;
+  // Use the smaller of: base available or adaptive budget (to respect both limits)
+  const availableTokens = Math.min(baseAvailable, adaptiveTokenBudget);
 
   const totalTokens = estimateTotalTokens(messages);
 
@@ -128,6 +157,7 @@ export async function truncateMessages(
       finalCount: messages.length,
       estimatedTokens: totalTokens,
       topicShiftDetected,
+      adaptiveWindowSize,
     };
   }
 
@@ -226,6 +256,7 @@ export async function truncateMessages(
     potentialFactsWarning,
     backupFailed,
     topicShiftDetected,
+    adaptiveWindowSize,
   };
 }
 
