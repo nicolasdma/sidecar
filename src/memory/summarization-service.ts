@@ -16,8 +16,9 @@ import {
   type SummaryRow,
   type SummaryData,
 } from './store.js';
-import { generateJsonWithOllama, checkOllamaAvailability } from '../llm/ollama.js';
+import { generateWithOllama, checkOllamaAvailability, cleanJsonResponse } from '../llm/ollama.js';
 import { createLogger } from '../utils/logger.js';
+import { parseSummary, safeJsonParse, type Summary as ZodSummary } from './schemas.js';
 
 const logger = createLogger('summarization');
 
@@ -35,14 +36,6 @@ Maximum 5 discussed points, 3 decisions, 3 open questions.
 Messages:
 `;
 
-interface RawSummary {
-  topic: string;
-  discussed: string[];
-  outcome?: string | null;
-  decisions?: string[] | null;
-  open_questions?: string[] | null;
-}
-
 /**
  * Formats messages for the summarization prompt.
  */
@@ -57,41 +50,15 @@ function formatMessagesForPrompt(messages: Message[]): string {
 }
 
 /**
- * Validates and normalizes a raw summary from LLM.
+ * Converts Zod-validated summary to SummaryData for storage.
  */
-function validateSummary(raw: RawSummary): SummaryData | null {
-  if (!raw.topic || typeof raw.topic !== 'string') {
-    logger.warn('Invalid summary: missing topic');
-    return null;
-  }
-
-  if (!raw.discussed || !Array.isArray(raw.discussed) || raw.discussed.length === 0) {
-    logger.warn('Invalid summary: missing discussed points');
-    return null;
-  }
-
-  // Normalize and limit arrays
-  const discussed = raw.discussed
-    .filter(d => typeof d === 'string' && d.trim())
-    .slice(0, 5)
-    .map(d => d.trim().slice(0, 100));
-
-  const decisions = raw.decisions
-    ?.filter(d => typeof d === 'string' && d.trim())
-    .slice(0, 3)
-    .map(d => d.trim().slice(0, 100));
-
-  const openQuestions = raw.open_questions
-    ?.filter(q => typeof q === 'string' && q.trim())
-    .slice(0, 3)
-    .map(q => q.trim().slice(0, 100));
-
+function toSummaryData(summary: ZodSummary): SummaryData {
   return {
-    topic: raw.topic.trim().slice(0, 50),
-    discussed,
-    outcome: raw.outcome?.trim().slice(0, 200) || undefined,
-    decisions: decisions?.length ? decisions : undefined,
-    openQuestions: openQuestions?.length ? openQuestions : undefined,
+    topic: summary.topic,
+    discussed: summary.discussed,
+    outcome: summary.outcome ?? undefined,
+    decisions: summary.decisions ?? undefined,
+    openQuestions: summary.open_questions ?? undefined,
     turnStart: 0, // Will be set by caller
     turnEnd: 0,   // Will be set by caller
   };
@@ -137,20 +104,28 @@ export async function summarizeMessages(
     const formattedMessages = formatMessagesForPrompt(messages);
     const prompt = SUMMARIZATION_PROMPT + formattedMessages;
 
-    // Generate summary
-    const rawSummary = await generateJsonWithOllama<RawSummary>(prompt);
+    // Generate response from Ollama
+    const rawResponse = await generateWithOllama(prompt);
+    const cleanedResponse = cleanJsonResponse(rawResponse);
 
-    if (!rawSummary) {
-      logger.warn('Failed to generate summary');
+    // Parse JSON
+    const parsed = safeJsonParse(cleanedResponse);
+    if (parsed === null) {
+      logger.warn('Failed to parse JSON from summary response', {
+        response: cleanedResponse.slice(0, 200),
+      });
       return;
     }
 
-    // Validate
-    const summary = validateSummary(rawSummary);
-    if (!summary) {
+    // Validate with Zod schema
+    const validatedSummary = parseSummary(parsed, logger);
+    if (!validatedSummary) {
       logger.warn('Invalid summary from LLM');
       return;
     }
+
+    // Convert to storage format
+    const summary = toSummaryData(validatedSummary);
 
     // Set turn range
     const range = getMessageRange(messages, turnOffset);

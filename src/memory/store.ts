@@ -110,15 +110,11 @@ const SCHEMA = `
 
 /**
  * Fase 2 schema migrations.
- * These are ALTER TABLE statements that must be run separately
- * since they can fail if columns already exist.
+ * NOTE: aging/priority columns were removed per plan review.
+ * Decay is now computed at runtime via getDecayStatus() using last_confirmed_at.
+ * Empty array kept for backwards compatibility with migration runner.
  */
-const FASE2_MIGRATIONS = [
-  // Add aging column to facts (for decay service)
-  `ALTER TABLE facts ADD COLUMN aging INTEGER DEFAULT 0`,
-  // Add priority column to facts (for decay service)
-  `ALTER TABLE facts ADD COLUMN priority TEXT DEFAULT 'normal' CHECK (priority IN ('normal', 'low'))`,
-];
+const FASE2_MIGRATIONS: string[] = [];
 
 interface MessageRow {
   id: number;
@@ -136,8 +132,6 @@ export type FactConfidence = 'high' | 'medium' | 'low';
 export type FactScope = 'global' | 'project' | 'session';
 export type FactSource = 'explicit' | 'inferred' | 'migrated';
 
-export type FactPriority = 'normal' | 'low';
-
 export interface FactRow {
   id: string;
   domain: FactDomain;
@@ -150,9 +144,6 @@ export interface FactRow {
   source: FactSource;
   stale: number;
   archived: number;
-  // Fase 2 decay columns
-  aging: number;
-  priority: FactPriority;
 }
 
 // ============= Fase 2: Pending Extraction Types =============
@@ -778,7 +769,38 @@ export function recoverStalledExtractions(): number {
 }
 
 /**
+ * Health-related keywords that should never be dropped from queue.
+ * These are critical facts that could affect user safety.
+ */
+const HEALTH_KEYWORDS = [
+  // Spanish
+  'alergia', 'alergico', 'alérgico', 'alergica', 'alérgica',
+  'medicamento', 'medicina', 'pastilla', 'remedio',
+  'enfermedad', 'enfermo', 'enferma',
+  'diabetes', 'diabético', 'diabetico', 'diabética', 'diabetica',
+  'hipertensión', 'hipertension', 'presión', 'presion',
+  'asma', 'asmático', 'asmatico',
+  'epilepsia', 'epiléptico', 'epileptico',
+  'cirugía', 'cirugia', 'operación', 'operacion',
+  'embarazo', 'embarazada',
+  'doctor', 'médico', 'medico', 'hospital', 'clínica', 'clinica',
+  // English
+  'allergy', 'allergic', 'medication', 'medicine', 'pill',
+  'disease', 'diabetes', 'diabetic', 'hypertension', 'asthma',
+  'epilepsy', 'surgery', 'pregnant', 'pregnancy', 'hospital',
+];
+
+/**
+ * Checks if content contains health-related keywords.
+ */
+function containsHealthKeywords(content: string): boolean {
+  const lower = content.toLowerCase();
+  return HEALTH_KEYWORDS.some(keyword => lower.includes(keyword));
+}
+
+/**
  * Enforces max queue size by removing oldest pending items.
+ * IMPORTANT: Items containing health keywords are never dropped.
  * Called when queue exceeds MAX_QUEUE_SIZE to prevent unbounded growth.
  *
  * @param maxSize - Maximum number of pending items to keep (default: 1000)
@@ -798,22 +820,53 @@ export function enforceQueueSizeLimit(maxSize: number = 1000): number {
     return 0;
   }
 
-  // Remove oldest pending items to get below limit
+  // Get oldest pending items to evaluate for deletion
   const toRemove = count - maxSize;
+  const selectStmt = database.prepare(`
+    SELECT id, content FROM pending_extraction
+    WHERE status = 'pending'
+    ORDER BY created_at ASC
+    LIMIT ?
+  `);
+  const candidates = selectStmt.all(toRemove * 2) as Array<{ id: number; content: string }>;
+
+  // Filter out health-related items
+  const idsToDelete: number[] = [];
+  let healthProtected = 0;
+
+  for (const item of candidates) {
+    if (idsToDelete.length >= toRemove) break;
+
+    if (containsHealthKeywords(item.content)) {
+      healthProtected++;
+      continue;
+    }
+
+    idsToDelete.push(item.id);
+  }
+
+  if (idsToDelete.length === 0) {
+    if (healthProtected > 0) {
+      logger.warn('Queue overflow but all items contain health keywords - keeping all', {
+        queueSize: count,
+        healthProtected,
+      });
+    }
+    return 0;
+  }
+
+  // Delete non-health items
+  const placeholders = idsToDelete.map(() => '?').join(',');
   const deleteStmt = database.prepare(`
     DELETE FROM pending_extraction
-    WHERE id IN (
-      SELECT id FROM pending_extraction
-      WHERE status = 'pending'
-      ORDER BY created_at ASC
-      LIMIT ?
-    )
+    WHERE id IN (${placeholders})
   `);
 
-  const result = deleteStmt.run(toRemove);
+  const result = deleteStmt.run(...idsToDelete);
   if (result.changes > 0) {
-    logger.warn('Enforced queue size limit - dropped oldest items', {
+    logger.warn('Enforced queue size limit - dropped oldest non-health items', {
       removed: result.changes,
+      healthProtected,
       maxSize,
     });
   }
@@ -971,28 +1024,6 @@ export function clearSummaries(): void {
 // ============= Fase 2: Fact Decay Functions =============
 
 /**
- * Updates aging status for a fact.
- */
-export function updateFactAging(id: string, aging: number): void {
-  const database = getDatabase();
-  const stmt = database.prepare(`
-    UPDATE facts SET aging = ? WHERE id = ?
-  `);
-  stmt.run(aging, id);
-}
-
-/**
- * Updates priority for a fact.
- */
-export function updateFactPriority(id: string, priority: FactPriority): void {
-  const database = getDatabase();
-  const stmt = database.prepare(`
-    UPDATE facts SET priority = ? WHERE id = ?
-  `);
-  stmt.run(priority, id);
-}
-
-/**
  * Gets facts that need decay check (not stale, not archived).
  * @deprecated Use getFactsForDecayCheckPaginated for large datasets
  */
@@ -1039,8 +1070,13 @@ export function getFactsForDecayCount(): number {
 }
 
 /**
- * Gets decay statistics using SQL aggregation.
- * More efficient than loading all facts into memory.
+ * Gets decay statistics using SQL date math.
+ * Computes decay stages at query time based on last_confirmed_at.
+ *
+ * Decay stages:
+ * - aging: 60-89 days since confirmation
+ * - lowPriority: 90-119 days since confirmation
+ * - stale: 120+ days (uses stale column for efficiency)
  */
 export function getDecayStatsFromDb(): {
   aging: number;
@@ -1050,8 +1086,18 @@ export function getDecayStatsFromDb(): {
   const database = getDatabase();
   const stmt = database.prepare(`
     SELECT
-      SUM(CASE WHEN aging = 1 AND stale = 0 AND archived = 0 THEN 1 ELSE 0 END) as aging,
-      SUM(CASE WHEN priority = 'low' AND stale = 0 AND archived = 0 THEN 1 ELSE 0 END) as lowPriority,
+      SUM(CASE
+        WHEN stale = 0 AND archived = 0
+          AND julianday('now') - julianday(last_confirmed_at) >= 60
+          AND julianday('now') - julianday(last_confirmed_at) < 90
+        THEN 1 ELSE 0
+      END) as aging,
+      SUM(CASE
+        WHEN stale = 0 AND archived = 0
+          AND julianday('now') - julianday(last_confirmed_at) >= 90
+          AND julianday('now') - julianday(last_confirmed_at) < 120
+        THEN 1 ELSE 0
+      END) as lowPriority,
       SUM(CASE WHEN stale = 1 AND archived = 0 THEN 1 ELSE 0 END) as stale
     FROM facts
   `);

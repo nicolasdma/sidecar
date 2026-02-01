@@ -80,7 +80,7 @@ export async function checkOllamaAvailability(): Promise<{ available: boolean; m
  * Cleans LLM response by removing markdown code blocks and trimming.
  * Handles common patterns like ```json ... ``` or ``` ... ```
  */
-function cleanJsonResponse(raw: string): string {
+export function cleanJsonResponse(raw: string): string {
   return raw
     .replace(/```json\n?/gi, '')
     .replace(/```\n?/g, '')

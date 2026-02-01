@@ -198,14 +198,18 @@ export async function truncateMessages(
     }
 
     // Fase 2: Determine what to summarize based on topic shift
-    // If topic shift detected, summarize the full previous context (not just removed messages)
-    // This ensures we capture the complete topic before the shift
-    const messagesToSummarize = topicShiftDetected ? messages : removedMessages;
+    // If topic shift detected AND significant, summarize full context
+    // Otherwise, just summarize removed messages
+    const shouldSummarizeFullContext = topicShiftDetected &&
+      shouldTriggerSummarization({ shifted: true, previousDomain: undefined, newDomain: undefined });
+
+    const messagesToSummarize = shouldSummarizeFullContext ? messages : removedMessages;
 
     if (messagesToSummarize.length >= 2) {
       logger.debug('Triggering summarization', {
-        scope: topicShiftDetected ? 'full_context' : 'removed_messages',
+        scope: shouldSummarizeFullContext ? 'full_context' : 'removed_messages',
         messageCount: messagesToSummarize.length,
+        topicShiftDetected,
       });
       summarizeMessages(messagesToSummarize).catch(err => {
         logger.warn('Summarization failed', { error: err instanceof Error ? err.message : err });

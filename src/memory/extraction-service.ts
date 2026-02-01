@@ -31,9 +31,13 @@ import {
   type PendingExtractionRow,
 } from './store.js';
 import { saveFact, type NewFact } from './facts-store.js';
-import { generateJsonWithOllama, checkOllamaAvailability } from '../llm/ollama.js';
+import { generateWithOllama, checkOllamaAvailability, cleanJsonResponse } from '../llm/ollama.js';
 import { createLogger } from '../utils/logger.js';
-import type { FactDomain, FactConfidence } from './store.js';
+import {
+  parseExtractedFacts,
+  safeJsonParse,
+  type ExtractedFact,
+} from './schemas.js';
 
 const logger = createLogger('extraction');
 
@@ -70,87 +74,44 @@ Look for:
 Message:
 `;
 
-// Valid domains for validation
-const VALID_DOMAINS: FactDomain[] = [
-  'work', 'preferences', 'decisions', 'personal', 'projects',
-  'health', 'relationships', 'schedule', 'goals', 'general',
-];
-
-// Valid confidence levels
-const VALID_CONFIDENCE: FactConfidence[] = ['high', 'medium', 'low'];
-
-interface ExtractedFact {
-  fact: string;
-  domain: string;
-  confidence: string;
-}
-
-// Minimum fact length to avoid garbage extractions
-// Lowered from 10 to 5 because Spanish facts can be short (e.g., "Es vegano")
-const MIN_FACT_LENGTH = 5;
-
 /**
- * Validates and normalizes an extracted fact.
+ * Converts a Zod-validated ExtractedFact to NewFact for storage.
  */
-function validateExtractedFact(raw: ExtractedFact): NewFact | null {
-  // Validate fact text exists
-  if (!raw.fact || typeof raw.fact !== 'string') {
-    return null;
-  }
-
-  const factText = raw.fact.trim();
-
-  // Reject facts that are too short
-  if (factText.length < MIN_FACT_LENGTH) {
-    logger.debug('Rejected fact: too short', { fact: factText });
-    return null;
-  }
-
-  // Reject facts that are just a domain name (common LLM mistake)
-  if (VALID_DOMAINS.includes(factText.toLowerCase() as FactDomain)) {
-    logger.debug('Rejected fact: is just a domain name', { fact: factText });
-    return null;
-  }
-
-  // Validate and normalize domain
-  const domain = raw.domain?.toLowerCase() as FactDomain;
-  if (!VALID_DOMAINS.includes(domain)) {
-    logger.warn('Invalid domain in extracted fact', { domain: raw.domain });
-    return null;
-  }
-
-  // Validate and normalize confidence
-  const confidence = raw.confidence?.toLowerCase() as FactConfidence;
-  const validConfidence = VALID_CONFIDENCE.includes(confidence) ? confidence : 'medium';
-
+function toNewFact(extracted: ExtractedFact): NewFact {
   return {
-    domain,
-    fact: factText,
-    confidence: validConfidence,
+    domain: extracted.domain,
+    fact: extracted.fact,
+    confidence: extracted.confidence,
     source: 'inferred',
   };
 }
 
 /**
  * Extracts facts from text using Ollama.
- * Returns validated facts ready for storage.
+ * Returns Zod-validated facts ready for storage.
  */
 async function extractFactsFromText(text: string): Promise<NewFact[]> {
   const prompt = EXTRACTION_PROMPT + text;
 
-  const rawFacts = await generateJsonWithOllama<ExtractedFact[]>(prompt);
+  // Generate response from Ollama
+  const rawResponse = await generateWithOllama(prompt);
+  const cleanedResponse = cleanJsonResponse(rawResponse);
 
-  if (!rawFacts || !Array.isArray(rawFacts)) {
-    logger.debug('No facts extracted or invalid response');
+  // Parse JSON
+  const parsed = safeJsonParse(cleanedResponse);
+  if (parsed === null) {
+    logger.debug('Failed to parse JSON from extraction response', {
+      response: cleanedResponse.slice(0, 200),
+    });
     return [];
   }
 
-  const validatedFacts: NewFact[] = [];
-  for (const raw of rawFacts) {
-    const validated = validateExtractedFact(raw);
-    if (validated) {
-      validatedFacts.push(validated);
-    }
+  // Validate with Zod schema (handles partial success gracefully)
+  const validatedFacts = parseExtractedFacts(parsed, logger);
+
+  if (validatedFacts.length === 0) {
+    logger.debug('No valid facts extracted', { input: text.slice(0, 100) });
+    return [];
   }
 
   logger.debug('Extracted facts', {
@@ -158,7 +119,7 @@ async function extractFactsFromText(text: string): Promise<NewFact[]> {
     extracted: validatedFacts.length,
   });
 
-  return validatedFacts;
+  return validatedFacts.map(toNewFact);
 }
 
 /**

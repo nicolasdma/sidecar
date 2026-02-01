@@ -13,10 +13,10 @@ import {
   type FactConfidence,
   type FactScope,
   type FactSource,
-  type FactPriority,
 } from './store.js';
 import { extractSignificantWords } from './stopwords.js';
 import { createLogger } from '../utils/logger.js';
+import { getDecayStatus } from './decay-service.js';
 
 const logger = createLogger('facts-store');
 
@@ -50,9 +50,6 @@ export interface StoredFact {
   source: FactSource;
   stale: boolean;
   archived: boolean;
-  // Fase 2 decay fields
-  aging: boolean;
-  priority: FactPriority;
 }
 
 // ============= Domain Mapping =============
@@ -98,9 +95,6 @@ function rowToFact(row: FactRow): StoredFact {
     source: row.source,
     stale: row.stale === 1,
     archived: row.archived === 1,
-    // Fase 2 decay fields
-    aging: row.aging === 1,
-    priority: row.priority ?? 'normal',
   };
 }
 
@@ -270,18 +264,15 @@ export function getFactById(id: string): StoredFact | null {
 
 // ============= Keyword Filtering =============
 
-// Minimum relevance score for low-priority facts (Fase 2 decay)
-const LOW_PRIORITY_MIN_SCORE = 0.5;
-
 /**
  * Filters facts by keyword matching against a query.
  * Uses word overlap scoring to rank relevance.
- * Fase 2: Respects priority - low priority facts need higher relevance.
+ * Fase 2: Uses getDecayStatus() to filter aging/low-priority facts.
  *
  * Algorithm:
  * 1. Extract significant words from query (remove stopwords)
- * 2. For each fact, count matching words
- * 3. Filter low-priority facts unless highly relevant
+ * 2. For each fact, count matching words and compute relevance score
+ * 3. Apply decay filtering: old facts need higher relevance to be included
  * 4. Return facts with at least one match, sorted by match count
  */
 export function filterFactsByKeywords(
@@ -306,9 +297,13 @@ export function filterFactsByKeywords(
   const queryWords = extractSignificantWords(query);
 
   if (queryWords.size === 0) {
-    // No significant words - return most recent normal-priority facts
+    // No significant words - return most recent facts that pass decay filter
     return rows
-      .filter(r => r.priority !== 'low')
+      .filter(row => {
+        const decay = getDecayStatus(row.last_confirmed_at);
+        // Without query relevance, only include fresh/aging facts
+        return decay.inject && decay.relevanceThreshold <= 0.3;
+      })
       .slice(0, limit)
       .map(rowToFact);
   }
@@ -330,8 +325,9 @@ export function filterFactsByKeywords(
       // Normalize score by query word count for fair comparison
       const score = matchCount / queryWords.size;
 
-      // Fase 2: Low priority facts need high relevance to be included
-      if (row.priority === 'low' && score < LOW_PRIORITY_MIN_SCORE) {
+      // Fase 2: Apply decay filtering based on relevance score
+      const decay = getDecayStatus(row.last_confirmed_at);
+      if (!decay.inject || score < decay.relevanceThreshold) {
         continue;
       }
 

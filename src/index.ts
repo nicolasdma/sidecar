@@ -12,10 +12,10 @@ async function main(): Promise<void> {
 
   validateConfig();
 
-  // Fase 2: Run decay check at startup
+  // Fase 2: Run decay check at startup (marks 120+ day old facts as stale)
   try {
     const decayResult = await runDecayCheck();
-    if (decayResult.markedStale > 0 || decayResult.markedLowPriority > 0 || decayResult.markedAging > 0) {
+    if (decayResult.markedStale > 0) {
       logger.info('Decay check completed', decayResult);
     }
   } catch (error) {

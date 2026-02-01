@@ -4,12 +4,16 @@
  * Gradually ages facts based on `last_confirmed_at` timestamp.
  * Facts that haven't been confirmed in a while become less relevant.
  *
- * Decay Rules:
- * | Days since confirmed | Action                                    |
- * |---------------------|-------------------------------------------|
- * | 60+                 | aging=1 (still injected, flagged for UI)  |
- * | 90+                 | priority='low' (only inject if relevant)  |
- * | 120+                | stale=1 (never inject automatically)      |
+ * Decay is computed at runtime via getDecayStatus() - no columns needed.
+ * Only the `stale` column is written (for 120+ days) to optimize queries.
+ *
+ * Decay Stages (computed from last_confirmed_at):
+ * | Days since confirmed | Stage        | Behavior                       |
+ * |---------------------|--------------|--------------------------------|
+ * | 0-59                | fresh        | Always inject                  |
+ * | 60-89               | aging        | Inject with slight threshold   |
+ * | 90-119              | low_priority | Only if query highly relevant  |
+ * | 120+                | stale        | Never inject (stale=1 in DB)   |
  *
  * Run: At startup + optionally daily
  */
@@ -18,8 +22,6 @@ import {
   getFactsForDecayCheckPaginated,
   getFactsForDecayCount,
   getDecayStatsFromDb,
-  updateFactAging,
-  updateFactPriority,
   markFactAsStale,
   type FactRow,
 } from './store.js';
@@ -39,9 +41,9 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const DECAY_BATCH_SIZE = 100;
 
 export interface DecayResult {
+  /** Total facts checked */
   checked: number;
-  markedAging: number;
-  markedLowPriority: number;
+  /** Facts newly marked as stale (120+ days) */
   markedStale: number;
 }
 
@@ -114,35 +116,6 @@ export function getDaysSinceConfirmed(fact: FactRow): number {
 }
 
 /**
- * Determines what decay action should be applied to a fact.
- */
-function determineDecayAction(
-  fact: FactRow,
-  daysSinceConfirmed: number
-): 'stale' | 'low_priority' | 'aging' | null {
-  // Already at the target state? Skip.
-  if (daysSinceConfirmed >= STALE_THRESHOLD_DAYS) {
-    // Should be stale
-    if (fact.stale === 1) return null;
-    return 'stale';
-  }
-
-  if (daysSinceConfirmed >= LOW_PRIORITY_THRESHOLD_DAYS) {
-    // Should be low priority
-    if (fact.priority === 'low') return null;
-    return 'low_priority';
-  }
-
-  if (daysSinceConfirmed >= AGING_THRESHOLD_DAYS) {
-    // Should be aging
-    if (fact.aging === 1) return null;
-    return 'aging';
-  }
-
-  return null;
-}
-
-/**
  * Helper to yield event loop between batches.
  * Prevents blocking on large fact sets.
  */
@@ -151,43 +124,31 @@ function yieldEventLoop(): Promise<void> {
 }
 
 /**
- * Processes a single batch of facts for decay.
+ * Checks if a fact should be marked as stale.
+ * Only facts >= 120 days need the stale column set.
+ * Other decay stages are computed at query time.
+ */
+function shouldMarkStale(fact: FactRow): boolean {
+  // Already stale? Skip.
+  if (fact.stale === 1) return false;
+
+  const days = getDaysSinceConfirmed(fact);
+  return days >= STALE_THRESHOLD_DAYS;
+}
+
+/**
+ * Processes a batch of facts, marking stale ones.
  */
 function processBatch(facts: FactRow[], result: DecayResult): void {
   for (const fact of facts) {
-    const daysSinceConfirmed = getDaysSinceConfirmed(fact);
-    const action = determineDecayAction(fact, daysSinceConfirmed);
-
-    if (action === null) continue;
-
-    switch (action) {
-      case 'stale':
-        markFactAsStale(fact.id);
-        result.markedStale++;
-        logger.info('Fact marked stale', {
-          id: fact.id,
-          days: daysSinceConfirmed,
-          fact: fact.fact.slice(0, 50),
-        });
-        break;
-
-      case 'low_priority':
-        updateFactPriority(fact.id, 'low');
-        result.markedLowPriority++;
-        logger.debug('Fact marked low priority', {
-          id: fact.id,
-          days: daysSinceConfirmed,
-        });
-        break;
-
-      case 'aging':
-        updateFactAging(fact.id, 1);
-        result.markedAging++;
-        logger.debug('Fact marked aging', {
-          id: fact.id,
-          days: daysSinceConfirmed,
-        });
-        break;
+    if (shouldMarkStale(fact)) {
+      markFactAsStale(fact.id);
+      result.markedStale++;
+      logger.info('Fact marked stale', {
+        id: fact.id,
+        days: getDaysSinceConfirmed(fact),
+        fact: fact.fact.slice(0, 50),
+      });
     }
   }
 }
@@ -201,8 +162,6 @@ function processBatch(facts: FactRow[], result: DecayResult): void {
 export async function runDecayCheck(): Promise<DecayResult> {
   const result: DecayResult = {
     checked: 0,
-    markedAging: 0,
-    markedLowPriority: 0,
     markedStale: 0,
   };
 
@@ -233,7 +192,7 @@ export async function runDecayCheck(): Promise<DecayResult> {
       }
     }
 
-    if (result.markedAging > 0 || result.markedLowPriority > 0 || result.markedStale > 0) {
+    if (result.markedStale > 0) {
       logger.info('Decay check completed', result);
     } else {
       logger.debug('Decay check: no changes needed', { checked: result.checked });
@@ -243,20 +202,6 @@ export async function runDecayCheck(): Promise<DecayResult> {
   } catch (error) {
     logger.error('Decay check failed', { error });
     throw error;
-  }
-}
-
-/**
- * Resets decay status when a fact is confirmed.
- * Called when user re-confirms a fact through /remember or natural conversation.
- */
-export function resetFactDecay(factId: string): void {
-  try {
-    updateFactAging(factId, 0);
-    updateFactPriority(factId, 'normal');
-    logger.debug('Reset decay for fact', { factId });
-  } catch (error) {
-    logger.warn('Failed to reset fact decay', { factId, error });
   }
 }
 
