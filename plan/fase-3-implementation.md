@@ -1,9 +1,10 @@
 # Fase 3: Semantic Intelligence Implementation Plan
 
-> **Status:** Implemented
+> **Status:** Implemented + Hardened
 > **Created:** 2026-02-01
 > **Updated:** 2026-02-01 (incorporated architecture review feedback)
 > **Implemented:** 2026-02-01
+> **Hardened:** 2026-02-01 (critical bugfixes applied)
 > **Depends on:** Fase 2 (Complete)
 
 ---
@@ -24,6 +25,7 @@
 12. [Performance Targets](#performance-targets)
 13. [Rollback Plan](#rollback-plan)
 14. [Implementation Order](#implementation-order)
+15. [Post-Implementation Hardening](#post-implementation-hardening)
 
 ---
 
@@ -2146,3 +2148,141 @@ All features are behind capability checks. The system works identically to Fase 
 12. **Task 12:** Verification tests
 
 Each task produces working code. System remains functional after each step due to graceful degradation.
+
+---
+
+## Post-Implementation Hardening
+
+After initial implementation, a code review identified several issues that were addressed to improve robustness and prevent edge case failures.
+
+### Issues Identified and Fixed
+
+#### Critical Fixes (Applied)
+
+| Issue | Problem | Solution | File |
+|-------|---------|----------|------|
+| **Unbounded Queue Growth** | If embedding model never loads, `pending_embedding` queue grows indefinitely | Added `enforceEmbeddingQueueLimit()` with hard cap at 1000 items, called on worker startup | `embedding-worker.ts` |
+| **No Schema Versioning** | No way to track which migration version a database is at | Added `schema_version` table with `runMigrations()` runner for future-proof migrations | `store.ts` |
+
+#### Medium Fixes (Applied)
+
+| Issue | Problem | Solution | File |
+|-------|---------|----------|------|
+| **Vector Index Drift** | If `upsertFactVector()` fails, embeddings exist in `fact_embeddings` but not in `fact_vectors` | Added `reconcileVectorIndex()` that re-indexes orphaned embeddings on startup | `embedding-worker.ts` |
+| **Cache Never Cleaned** | `cleanupExpiredCache()` existed but was never scheduled | Added hourly cleanup call in `processEmbeddingQueue()` tick | `embedding-worker.ts` |
+| **SOUL.md Hot Reload** | Hash cached at module load, changes during session not detected | Modified `computeSoulHash()` to check file mtime on each lookup | `response-cache.ts` |
+
+#### Low Priority (Deferred)
+
+| Issue | Status | Notes |
+|-------|--------|-------|
+| **Batch Embedding API** | Deferred | `embedTexts()` loops over `embedText()`. Batch API would improve performance but requires transformers.js testing. |
+| **Pipeline Disposal** | Deferred | Embedding pipeline never disposed. Add `disposePipeline()` for memory cleanup on shutdown. |
+| **brain.ts Cache Integration** | Not Implemented | `checkCache()` and `saveToCache()` exist but are not wired into `think()`. Response cache is available but unused. |
+
+### Code Changes Summary
+
+**embedding-worker.ts:**
+```typescript
+// New constant
+const MAX_PENDING_EMBEDDINGS = 1000;
+const CACHE_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+
+// New tracking variable
+let lastCacheCleanup = 0;
+
+// New function: enforceEmbeddingQueueLimit()
+// Caps queue at 1000 items by deleting oldest pending entries
+
+// New function: reconcileVectorIndex()
+// Re-indexes any fact_embeddings missing from fact_vectors
+
+// Modified: processEmbeddingQueue()
+// Added hourly cleanupExpiredCache() + cleanupFailedEmbeddings() calls
+
+// Modified: startEmbeddingWorker()
+// Calls reconcileVectorIndex() and enforceEmbeddingQueueLimit() on startup
+```
+
+**store.ts:**
+```typescript
+// New constant
+const CURRENT_SCHEMA_VERSION = 3;
+
+// New table in SCHEMA
+CREATE TABLE IF NOT EXISTS schema_version (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  version INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
+// New functions
+function getSchemaVersion(database): number
+function setSchemaVersion(database, version): void
+function runMigrations(database): void
+
+// Modified: getDatabase()
+// Calls runMigrations() after runFase2Migrations()
+```
+
+**response-cache.ts:**
+```typescript
+// New tracking variable
+let soulMtime: number = 0;
+
+// Modified: computeSoulHash()
+// Now checks file mtime and recomputes hash if file changed
+// Uses statSync() to detect modifications during session
+```
+
+### Testing the Fixes
+
+```bash
+# 1. Queue Limit Test
+# Create 2000 facts with embeddings disabled, then re-enable
+# Verify queue capped at 1000 in logs
+
+# 2. Schema Version Test
+sqlite3 data/sidecar.db "SELECT * FROM schema_version"
+# Expected: id=1, version=3
+
+# 3. Vector Index Reconciliation Test
+# Manually delete rows from fact_vectors
+sqlite3 data/sidecar.db "DELETE FROM fact_vectors WHERE rowid % 2 = 0"
+# Restart app and check logs for "Reconciling vector index"
+
+# 4. Cache Cleanup Test
+# Insert expired cache entry
+sqlite3 data/sidecar.db "INSERT INTO response_cache
+  (query_hash, query_embedding, fact_ids_hash, system_version, response, ttl_seconds, created_at)
+  VALUES ('test', x'00', 'test', 'test', 'test', 1, datetime('now', '-1 hour'))"
+# Wait for worker tick or force cleanup
+# Verify entry deleted
+
+# 5. SOUL.md Hot Reload Test
+# Query something (triggers cache save with current SOUL hash)
+# Modify SOUL.md: echo "# Modified" >> SOUL.md
+# Same query should miss cache (different system_version)
+```
+
+### Remaining Work for Future Phases
+
+1. **Wire brain.ts cache integration** - The response cache infrastructure is complete but the `think()` method doesn't call `checkCache()` or `saveToCache()`. This requires:
+   - Importing cache functions in brain.ts
+   - Adding cache check before LLM call
+   - Adding cache save after successful response
+   - Adding TTL classification based on query type
+
+2. **Add batch embedding** - Replace `embedTexts()` loop with native batch API for better performance on large fact sets.
+
+3. **Add pipeline disposal** - Call `disposePipeline()` in shutdown handler to free memory.
+
+---
+
+## Commit History
+
+| Date | Commit | Description |
+|------|--------|-------------|
+| 2026-02-01 | `[Fase 3] Add semantic intelligence implementation plan` | Initial plan document |
+| 2026-02-01 | `[Fase 3] Implement semantic intelligence: embeddings, vector search, caching` | Full implementation |
+| 2026-02-01 | `[Fase 3] Fix critical bugs: queue limits, schema versioning, cache cleanup` | Post-review hardening |

@@ -12,7 +12,7 @@
  */
 
 import { createHash } from 'crypto';
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, statSync } from 'fs';
 import { join } from 'path';
 import { createLogger } from '../utils/logger.js';
 import { embedText, isModelReady } from './embeddings-model.js';
@@ -36,36 +36,40 @@ export const CACHE_TTL = {
   greeting: 5 * 60,          // 5min for greetings (to vary)
 } as const;
 
-// Cache SOUL hash at module load
+// Cache SOUL hash and mtime for hot-reload detection
 let soulHash: string | null = null;
+let soulMtime: number = 0;
 
 /**
  * Computes a hash of SOUL.md content.
- * Cached for process lifetime.
+ * Recomputes if file mtime has changed since last check.
  */
 function computeSoulHash(): string {
-  if (soulHash !== null) {
-    return soulHash;
-  }
-
   const soulPath = join(process.cwd(), 'SOUL.md');
 
-  if (existsSync(soulPath)) {
-    try {
-      const content = readFileSync(soulPath, 'utf8');
-      soulHash = createHash('md5').update(content).digest('hex').slice(0, 8);
-      logger.debug('Computed SOUL hash', { hash: soulHash });
-    } catch (error) {
-      logger.warn('Failed to read SOUL.md for hash', {
-        error: error instanceof Error ? error.message : 'Unknown',
-      });
-      soulHash = 'default';
-    }
-  } else {
-    soulHash = 'default';
+  if (!existsSync(soulPath)) {
+    return 'default';
   }
 
-  return soulHash;
+  try {
+    const stat = statSync(soulPath);
+    const currentMtime = stat.mtimeMs;
+
+    // Recompute if file changed or first call
+    if (soulHash === null || currentMtime !== soulMtime) {
+      const content = readFileSync(soulPath, 'utf8');
+      soulHash = createHash('md5').update(content).digest('hex').slice(0, 8);
+      soulMtime = currentMtime;
+      logger.debug('Computed SOUL hash', { hash: soulHash, mtime: currentMtime });
+    }
+
+    return soulHash;
+  } catch (error) {
+    logger.warn('Failed to read SOUL.md for hash', {
+      error: error instanceof Error ? error.message : 'Unknown',
+    });
+    return 'default';
+  }
 }
 
 /**
@@ -241,4 +245,5 @@ export function cleanupCache(): number {
  */
 export function resetSoulHash(): void {
   soulHash = null;
+  soulMtime = 0;
 }

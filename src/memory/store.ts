@@ -6,7 +6,17 @@ import { createLogger } from '../utils/logger.js';
 
 const logger = createLogger('memory');
 
+// Current schema version (increment when adding new migrations)
+const CURRENT_SCHEMA_VERSION = 3;
+
 const SCHEMA = `
+  -- Schema version tracking for migrations
+  CREATE TABLE IF NOT EXISTS schema_version (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    version INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT DEFAULT (datetime('now'))
+  );
+
   CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'tool')),
@@ -153,6 +163,79 @@ const SCHEMA = `
  */
 const FASE2_MIGRATIONS: string[] = [];
 
+// ============= Schema Versioning and Migrations =============
+
+interface Migration {
+  version: number;
+  name: string;
+  sql: string;
+}
+
+/**
+ * Database migrations for schema changes.
+ * Each migration runs once when version is greater than stored version.
+ */
+const MIGRATIONS: Migration[] = [
+  // Future migrations go here, e.g.:
+  // { version: 4, name: 'add-embedding-metadata', sql: 'ALTER TABLE ...' },
+];
+
+/**
+ * Gets the current schema version from the database.
+ */
+function getSchemaVersion(database: Database.Database): number {
+  try {
+    const row = database.prepare(
+      'SELECT version FROM schema_version WHERE id = 1'
+    ).get() as { version: number } | undefined;
+    return row?.version ?? 0;
+  } catch {
+    // Table might not exist yet
+    return 0;
+  }
+}
+
+/**
+ * Sets the schema version in the database.
+ */
+function setSchemaVersion(database: Database.Database, version: number): void {
+  database.prepare(`
+    INSERT INTO schema_version (id, version) VALUES (1, ?)
+    ON CONFLICT(id) DO UPDATE SET version = ?, updated_at = datetime('now')
+  `).run(version, version);
+}
+
+/**
+ * Runs pending migrations and updates schema version.
+ */
+function runMigrations(database: Database.Database): void {
+  const currentVersion = getSchemaVersion(database);
+
+  // Initialize schema version for new databases
+  if (currentVersion === 0) {
+    setSchemaVersion(database, CURRENT_SCHEMA_VERSION);
+    logger.info('Initialized schema version', { version: CURRENT_SCHEMA_VERSION });
+    return;
+  }
+
+  // Run pending migrations
+  for (const migration of MIGRATIONS) {
+    if (migration.version > currentVersion) {
+      logger.info('Applying migration', {
+        version: migration.version,
+        name: migration.name,
+      });
+
+      database.transaction(() => {
+        database.exec(migration.sql);
+        setSchemaVersion(database, migration.version);
+      })();
+
+      logger.info('Migration applied', { version: migration.version });
+    }
+  }
+}
+
 interface MessageRow {
   id: number;
   role: 'user' | 'assistant' | 'tool';
@@ -283,6 +366,9 @@ export function getDatabase(): Database.Database {
 
   // Fase 2: Run migrations for new columns
   runFase2Migrations(db);
+
+  // Run schema version migrations
+  runMigrations(db);
 
   logger.info(`Database initialized: ${dbPath}`);
   return db;
