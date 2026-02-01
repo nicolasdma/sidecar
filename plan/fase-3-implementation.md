@@ -1,11 +1,13 @@
 # Fase 3: Semantic Intelligence Implementation Plan
 
-> **Status:** Implemented + Hardened
+> **Status:** ✅ COMPLETE (Implemented + Hardened + Final Fixes)
 > **Created:** 2026-02-01
 > **Updated:** 2026-02-01 (incorporated architecture review feedback)
 > **Implemented:** 2026-02-01
 > **Hardened:** 2026-02-01 (critical bugfixes applied)
+> **Final Fixes:** 2026-02-01 (production-ready, see `fase-3-final-fixes.md`)
 > **Depends on:** Fase 2 (Complete)
+> **Next:** Fase 3.5 LocalRouter (code ready, pending tests/bugfixes)
 
 ---
 
@@ -2066,24 +2068,24 @@ sqlite3 data/sidecar.db "SELECT version FROM schema_version"
 
 ## Success Criteria
 
-- [ ] `EMBEDDINGS_ENABLED=false` disables all embedding functionality
-- [ ] Embeddings load on M1/M2 Mac and Linux x64
-- [ ] System path detection works (Homebrew on macOS)
-- [ ] Lazy model loading doesn't block startup
-- [ ] Model loading retries with exponential backoff
-- [ ] Graceful degradation to Fase 2 when unavailable
-- [ ] Circuit breaker prevents infinite retry loops
-- [ ] "deployment process" finds "k8s deploy" fact (semantic match)
-- [ ] Hybrid search combines vector and keyword scores
-- [ ] Cache prevents duplicate LLM calls for similar queries
-- [ ] Cache invalidates on SOUL.md changes
-- [ ] Cache invalidates on LLM model changes
-- [ ] Adaptive window adjusts based on topic continuity
-- [ ] Facts are embedded within 10 seconds of creation
-- [ ] Stalled embeddings recover on restart
-- [ ] Failed embeddings are cleaned up after 7 days
-- [ ] Re-embedding triggers on model version change
-- [ ] Database migration works from Fase 2 databases
+- [x] `EMBEDDINGS_ENABLED=false` disables all embedding functionality
+- [x] Embeddings load on M1/M2 Mac and Linux x64
+- [x] System path detection works (Homebrew on macOS)
+- [x] Lazy model loading doesn't block startup
+- [x] Model loading retries with exponential backoff
+- [x] Graceful degradation to Fase 2 when unavailable
+- [x] Circuit breaker prevents infinite retry loops
+- [x] "deployment process" finds "k8s deploy" fact (semantic match)
+- [x] Hybrid search combines vector and keyword scores
+- [N/A] Response cache deferred (risk of stale responses, LocalRouter handles deterministic tools)
+- [x] Adaptive window adjusts based on topic continuity
+- [x] Facts are embedded within 10 seconds of creation
+- [x] Stalled embeddings recover on restart
+- [x] Failed embeddings are cleaned up after 7 days
+- [x] Re-embedding triggers on model version change
+- [x] Database migration works from Fase 2 databases
+- [x] Clear startup messaging about embeddings status (Fase 3 Final Fixes)
+- [x] npm test scripts for Phase 3 (Fase 3 Final Fixes)
 
 ---
 

@@ -1,7 +1,43 @@
 # Plan: AI Agent Companion (Nuevo Proyecto)
 
-> Estado: ✅ FASE 3 COMPLETADA | ✅ MEMORY ARCHITECTURE FASE 2 COMPLETADA
-> Última actualización: 2026-02-01 (actualización 21)
+> Estado: ✅ FASE 3 COMPLETADA | ⚠️ FASE 3.5 CÓDIGO LISTO (pendiente tests/bugfixes) | ✅ MEMORY ARCHITECTURE FASE 3 COMPLETADA
+> Última actualización: 2026-02-01 (actualización 24 - Fase 3 hardening completado, documentación actualizada)
+
+---
+
+## Resumen de Estado Actual
+
+### Memory Architecture (Semántica)
+| Fase | Estado | Descripción |
+|------|--------|-------------|
+| Fase 1 | ✅ | Foundation: SQLite, ventana 6 turnos, `/remember`, `/facts` |
+| Fase 2 | ✅ | Extracción automática, summarization, topic shift, decay |
+| **Fase 3** | ✅ | **Embeddings + vector search + ventana adaptativa + hardening** |
+| Fase 3.5 | ⚠️ | LocalRouter código listo, pendiente tests/bugfixes |
+| Fase 4 | ⏳ | Memory Agent local, métricas, archive |
+
+### Fase 3 Semántica - Detalle Final
+
+**Implementado:**
+- Embeddings locales con `all-MiniLM-L6-v2` via transformers.js
+- Vector search híbrido (70% vector + 30% keyword)
+- Ventana adaptativa (4/6/8 turnos según continuidad semántica)
+- Circuit breaker, graceful degradation, lazy loading
+
+**Hardening aplicado:**
+- Queue limits (max 1000 pending embeddings)
+- Schema versioning con migrations
+- Vector index reconciliation on startup
+- Hourly cache/failed cleanup
+- SOUL.md hot reload
+- Clear startup messaging
+- npm test scripts (`test:fase3`, `test:fase3:integration`)
+
+**Deprecado:**
+- Response cache: código existe (`response-cache.ts`) pero NO integrado en `brain.ts`
+- Razón: LocalRouter (3.5) maneja tools determinísticos; riesgo de stale responses
+
+**Documentación:** `plan/fase-3-implementation.md`, `plan/fase-3-final-fixes.md`
 
 ---
 
@@ -378,8 +414,10 @@ En `user.md`:
 | **Runtime** | Node.js + TypeScript | Ya conocido |
 | **LLM Default** | Kimi K2.5 (con cache) | Mejor balance precio/calidad, 262K context, cache 75% off |
 | **LLM Fallback** | Claude 3 Haiku | El más barato si Kimi falla |
+| **LLM Local** | Qwen2.5:3b-instruct via Ollama | LocalRouter para intents determinísticos (Fase 3.5) |
 | **Database** | SQLite (better-sqlite3) | Local, sin setup |
-| **Embeddings** | Jina Embeddings | Gratis tier generoso |
+| **Vector Search** | sqlite-vec extension | Extensión nativa, ~10ms search |
+| **Embeddings** | all-MiniLM-L6-v2 (transformers.js) | ~80MB, 384-dim, 100% local, lazy loading |
 | **Web Search** | Jina Reader (s.jina.ai) | GRATIS |
 | **Web Scrape** | Jina Reader (r.jina.ai) | GRATIS |
 | **WhatsApp** | @whiskeysockets/baileys | Activo, multi-device |
@@ -399,7 +437,14 @@ companion-agent/
 │   │   ├── brain.ts             # Agentic loop + orchestration
 │   │   ├── prompt-builder.ts    # System prompt construction
 │   │   ├── context-guard.ts     # Context window management
-│   │   └── proactive.ts         # Background thinking loop (Fase 3)
+│   │   ├── proactive/           # Background thinking loop (Fase 3)
+│   │   └── local-router/        # Pre-Brain intent routing (Fase 3.5)
+│   │       ├── index.ts         # LocalRouter class + exports
+│   │       ├── classifier.ts    # Qwen intent classification
+│   │       ├── direct-executor.ts  # Tool execution
+│   │       ├── response-templates.ts  # Response variants
+│   │       ├── validation-rules.ts  # Post-classification rules
+│   │       └── types.ts         # Interfaces
 │   │
 │   ├── memory/
 │   │   ├── store.ts             # SQLite operations
@@ -3802,6 +3847,105 @@ Día 5: Comandos y Polish
 | Natural language parsing con LLM | Heurística es suficiente | Cuando parsing falle frecuentemente |
 | Desktop notifications nativas | CLI es suficiente para MVP | Fase 5 |
 | Multi-timezone support | Un usuario, una timezone | Cuando haya multi-user |
+
+---
+
+### FASE 3.5: LocalRouter (Pre-Brain Intent Routing)
+**Objetivo:** Usar Qwen2.5-3B local como router de intents para ejecutar tools determinísticos sin llamar a Kimi K2.5.
+
+> **Estado:** En progreso
+> **Prerequisitos:** Fase 3 completada, Ollama + Qwen funcionando
+> **Spike:** Completado con 100% route accuracy (ver `src/experiments/local-router-spike/`)
+
+---
+
+#### Problema Resuelto
+
+El usuario pidió "Recordame en 10 min de las pastas". Kimi respondió amigablemente pero no llamó al tool. El recordatorio nunca se creó.
+
+**Causa raíz:** El LLM tiene agencia sobre si usar tools. Para operaciones determinísticas, esta agencia es innecesaria y riesgosa.
+
+---
+
+#### Arquitectura
+
+```
+Usuario Input
+      │
+      ▼
+┌─────────────────────┐
+│  LocalRouter        │  ← Qwen local, ~700ms
+│  (Intent Classifier)│
+└─────────────────────┘
+      │
+      ├── DIRECT_TOOL ───► DirectToolExecutor ───► Template Response
+      │   (determinístico)       │
+      │                          └── usa executeTool() del registry
+      │
+      └── ROUTE_TO_LLM ──► Brain ──► Kimi K2.5 ──► Response
+          (requiere agencia)
+```
+
+---
+
+#### Intents Soportados
+
+| Intent | Tool | Ejemplo |
+|--------|------|---------|
+| `time` | `get_current_time` | "qué hora es" |
+| `weather` | `get_weather` | "clima en Buenos Aires" |
+| `list_reminders` | `list_reminders` | "mis recordatorios" |
+| `reminder` | `set_reminder` | "recordame en 10 min de X" |
+| `cancel_reminder` | `find_reminder` + `cancel_reminder` | "cancela el de X" |
+
+Todo lo demás → ROUTE_TO_LLM (conversación, preguntas, ambiguo, etc.)
+
+---
+
+#### Implementación
+
+| Componente | Archivo | Estado |
+|------------|---------|--------|
+| Types & Interfaces | `src/agent/local-router/types.ts` | ✅ |
+| Intent Classifier | `src/agent/local-router/classifier.ts` | ✅ |
+| Validation Rules | `src/agent/local-router/validation-rules.ts` | ✅ |
+| Response Templates | `src/agent/local-router/response-templates.ts` | ✅ |
+| Direct Executor | `src/agent/local-router/direct-executor.ts` | ✅ |
+| Main Router Class | `src/agent/local-router/index.ts` | ✅ |
+| Config | `src/utils/config.ts` (localRouter section) | ✅ |
+| Brain Integration | `src/agent/brain.ts` (pre-routing) | ✅ |
+| Warm-up | `src/index.ts` (startup) | ✅ |
+| Metrics | LocalRouterStats in index.ts | ✅ |
+
+---
+
+#### Invariantes Críticos
+
+1. **DirectToolExecutor usa `executeTool()`** - NO reimplementa lógica de tools
+2. **Proactive mode SIEMPRE bypasea LocalRouter** - Solo procesa mensajes de usuario
+3. **Fallback a Brain incluye contexto** - Brain sabe que hubo un intento fallido
+4. **saveDirectResponse usa saveMessage()** - Mismo formato de history que Brain
+5. **Validar modelo exacto de Ollama** - No solo prefix match
+
+---
+
+#### Métricas de Éxito
+
+| Métrica | Target |
+|---------|--------|
+| % requests handled locally | 30-40% |
+| Latencia (local path) | < 1000ms |
+| False positives | 0 |
+| Kimi cost reduction | ~30% |
+| Fallback rate | < 5% |
+
+---
+
+#### Pendiente
+
+- [ ] Tests unitarios para classifier y executor
+- [ ] Tests de integración
+- [ ] Comando `/router-stats` para ver métricas
 
 ---
 

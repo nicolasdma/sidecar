@@ -11,19 +11,37 @@
 |------|--------|-------------|
 | **Fase 1** | ✅ Completada | Foundation - Schema SQLite, ventana 6 turnos, `/remember`, `/facts`, keyword filtering |
 | **Fase 2** | ✅ Completada | Extracción automática de facts, summarization, topic shift, confidence decay |
-| **Fase 3** | ✅ Completada | Embeddings locales, ventana adaptativa, ranking semántico (cache deprecado → 3.5) |
-| **Fase 3.5** | ⏳ Pendiente | LocalRouter - Qwen local para intents determinísticos |
+| **Fase 3** | ✅ Completada | Embeddings locales, ventana adaptativa, ranking semántico, hardening y bugfixes |
+| **Fase 3.5** | ⚠️ Código Listo | LocalRouter - Qwen local para intents determinísticos (pendiente tests/bugfixes) |
 | **Fase 4** | ⏳ Pendiente | Memory Agent local, comandos expandidos, métricas, archive |
 
-**Última actualización:** 2026-02-01
+**Última actualización:** 2026-02-01 (Fase 3 hardening completado)
 
-### Notas sobre Fase 3
+### Notas sobre Fase 3 (Completada)
 
-- **Embeddings:** Implementados con `all-MiniLM-L6-v2` via transformers.js
-- **Vector Search:** Híbrido (vector + keyword) integrado en `knowledge.ts`
-- **Ventana Adaptativa:** Integrada en `context-guard.ts` (4/6/8 turnos según continuidad)
-- **Response Cache:** Deprecado - Fase 3.5 LocalRouter subsume este caso de uso para tools determinísticos
-- **Ver:** `plan/fase-3-bugfix.md` para detalles de integración
+**Implementación Core:**
+- **Embeddings:** `all-MiniLM-L6-v2` via transformers.js (~80MB, lazy loading)
+- **Vector Storage:** `sqlite-vec` extension con fallback a keyword si no disponible
+- **Hybrid Search:** 70% vector + 30% keyword, integrado en `knowledge.ts`
+- **Ventana Adaptativa:** 4/6/8 turnos según semantic_continuity en `context-guard.ts`
+
+**Hardening Aplicado (Post-Implementation Fixes):**
+- ✅ Queue limits para `pending_embedding` (max 1000 items)
+- ✅ Schema versioning con `runMigrations()`
+- ✅ Vector index reconciliation al startup
+- ✅ Hourly cache cleanup scheduling
+- ✅ SOUL.md hot reload (mtime check)
+- ✅ Clear startup messaging sobre estado de embeddings
+- ✅ npm test scripts (`test:fase3`, `test:fase3:integration`)
+- ✅ Search mode tracking en `knowledge.ts`
+
+**Deprecaciones:**
+- **Response Cache:** Código en `response-cache.ts` existe pero **NO está integrado** en `brain.ts`. Deprecado porque Fase 3.5 LocalRouter maneja tools determinísticos directamente.
+- **Dedup de Intención:** Subsumido por LocalRouter.
+
+**Documentación:**
+- `plan/fase-3-implementation.md` - Plan completo con código de referencia
+- `plan/fase-3-final-fixes.md` - Fixes aplicados para production-ready
 
 ---
 
@@ -282,7 +300,7 @@ Si cualquier condición falla → re-inyectar instrucciones
 |-----------|-------------------|
 | Logs de ejecución | `data/logs/`, grep manual |
 | Debug steps | Flag `--verbose` a stdout |
-| Respuestas deterministas | Cache local, lookup pre-LLM |
+| Respuestas deterministas | LocalRouter (Fase 3.5) - Qwen classifica intent → DirectToolExecutor |
 | Estado interno del agente | Variables en memoria |
 | Historial de errores | SQLite `errors`, solo último si es retry |
 | Archivos completos | Solo fragmentos relevantes |
@@ -292,17 +310,21 @@ Si cualquier condición falla → re-inyectar instrucciones
 
 ```
 1. Request entra
-2. ¿Es determinista? → Cache hit → Return (sin LLM)
-3. ¿Requiere tool? → Ejecutar tool → Solo resultado al prompt
-4. Construir prompt:
+2. LocalRouter (Fase 3.5):
+   a. Qwen classifica intent (~700ms)
+   b. ¿Es DIRECT_TOOL? → DirectToolExecutor → Template Response → Return (sin Kimi)
+   c. ¿Es ROUTE_TO_LLM? → Continuar a paso 3
+3. Construir prompt:
    a. System prompt (cacheado)
    b. Facts filtrados por dominio
    c. Resúmenes (si existen)
    d. Ventana activa
-5. Validar tokens < 4000
+4. Validar tokens < 4000
    → Si excede: comprimir resúmenes primero, luego reducir ventana
-6. Llamar LLM
+5. Llamar Kimi K2.5
 ```
+
+**Nota:** El paso 2 (LocalRouter) solo aplica a mensajes de usuario, NO a proactive mode.
 
 ---
 
@@ -479,15 +501,16 @@ TOKENS USADOS: 490 (vs ~2000+ sin estrategia)
 
 ---
 
-### Fase 3: Inteligencia Semántica ✅ COMPLETADA
+### Fase 3: Inteligencia Semántica ✅ COMPLETADA + HARDENING
 
 **Objetivo:** Retrieval basado en significado, no keywords.
 
+**Implementación Core:**
 - [x] Embeddings locales
   - [x] Modelo: `all-MiniLM-L6-v2` (~80MB) via transformers.js
   - [x] Storage: `sqlite-vec` extension (con fallback a keyword)
   - [x] Embed facts al crear (async via embedding-worker)
-  - [x] Embed query en runtime
+  - [x] Embed query en runtime (lazy loading, exponential backoff)
 - [x] Ventana adaptativa
   - [x] `semantic_continuity` calculado por embeddings
   - [x] 4 turnos si continuity < 0.3
@@ -498,18 +521,52 @@ TOKENS USADOS: 490 (vs ~2000+ sin estrategia)
   - [x] Top-5 con threshold > 0.4
   - [x] Fallback a keyword si embeddings no disponibles
   - [x] Híbrido: 70% vector + 30% keyword
+
+**Hardening (Bugfixes Aplicados):**
+- [x] Queue limits: `pending_embedding` capped at 1000 items
+- [x] Schema versioning: `schema_version` table con `runMigrations()`
+- [x] Vector index reconciliation: `reconcileVectorIndex()` on startup
+- [x] Cache cleanup: hourly `cleanupExpiredCache()` + `cleanupFailedEmbeddings()`
+- [x] SOUL.md hot reload: `computeSoulHash()` checks mtime on each lookup
+- [x] Startup messaging: clear status about embeddings availability
+- [x] Test scripts: `npm run test:fase3`, `npm run test:fase3:integration`
+- [x] Search mode tracking: `getLastSearchMode()` in knowledge.ts
+
+**Deprecaciones:**
 - [x] Cache de respuestas deterministas
-  - [x] **DEPRECADO:** Fase 3.5 LocalRouter subsume este caso de uso
-  - [x] Código en response-cache.ts (no integrado, mantenido para referencia)
+  - [N/A] **DEPRECADO:** Código en response-cache.ts existe pero NO integrado en brain.ts
+  - [N/A] Razón: Riesgo de respuestas stale; LocalRouter (3.5) maneja tools determinísticos
 - [x] Dedup de intención
-  - [x] **DEPRECADO:** Fase 3.5 LocalRouter maneja tools determinísticos
+  - [N/A] **DEPRECADO:** LocalRouter maneja este caso de uso
 
 **Criterio de éxito:**
-- ✅ "deployment process" encuentra fact sobre "k8s deploy" (hybrid search)
-- ✅ Ventana adaptativa funciona según continuidad
-- ⚠️ Response cache deprecado en favor de LocalRouter (Fase 3.5)
+- ✅ `EMBEDDINGS_ENABLED=false` disables all embedding functionality
+- ✅ Embeddings load on M1/M2 Mac and Linux x64 (system + bundled fallback)
+- ✅ Lazy model loading with exponential backoff (doesn't block startup)
+- ✅ Graceful degradation to Fase 2 keyword matching when unavailable
+- ✅ Circuit breaker prevents infinite retry loops
+- ✅ "deployment process" finds "k8s deploy" fact (semantic match)
+- ✅ Hybrid search combines vector (70%) and keyword (30%) scores
+- ✅ Adaptive window adjusts based on topic continuity
+- ✅ Facts embedded within 10 seconds of creation
+- ✅ Stalled embeddings recover on restart
+- ✅ Failed embeddings cleaned up after 7 days
+- ✅ Re-embedding triggers on model version change
+- ✅ Database migration works from Fase 2 databases
+- ✅ Clear startup messaging about embeddings status
+- ✅ npm test scripts pass
+- [N/A] Response cache deferred (risk of stale responses, LocalRouter handles deterministic tools)
 
-**Ver:** `plan/fase-3-bugfix.md` para detalles de integración
+**Archivos clave:**
+- `src/memory/embeddings-model.ts` - Lazy loading + backoff
+- `src/memory/embedding-worker.ts` - Background queue with mutex
+- `src/memory/vector-search.ts` - Hybrid search implementation
+- `src/memory/semantic-continuity.ts` - Adaptive window calculation
+- `src/memory/response-cache.ts` - DEPRECATED (code exists, not integrated)
+
+**Documentación:**
+- `plan/fase-3-implementation.md` - Plan completo con código de referencia
+- `plan/fase-3-final-fixes.md` - Final fixes for production-ready
 
 ---
 
