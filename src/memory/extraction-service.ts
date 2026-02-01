@@ -77,12 +77,29 @@ interface ExtractedFact {
   confidence: string;
 }
 
+// Minimum fact length to avoid garbage extractions
+const MIN_FACT_LENGTH = 10;
+
 /**
  * Validates and normalizes an extracted fact.
  */
 function validateExtractedFact(raw: ExtractedFact): NewFact | null {
-  // Validate fact text
-  if (!raw.fact || typeof raw.fact !== 'string' || raw.fact.trim().length < 3) {
+  // Validate fact text exists
+  if (!raw.fact || typeof raw.fact !== 'string') {
+    return null;
+  }
+
+  const factText = raw.fact.trim();
+
+  // Reject facts that are too short
+  if (factText.length < MIN_FACT_LENGTH) {
+    logger.debug('Rejected fact: too short', { fact: factText });
+    return null;
+  }
+
+  // Reject facts that are just a domain name (common LLM mistake)
+  if (VALID_DOMAINS.includes(factText.toLowerCase() as FactDomain)) {
+    logger.debug('Rejected fact: is just a domain name', { fact: factText });
     return null;
   }
 
@@ -99,7 +116,7 @@ function validateExtractedFact(raw: ExtractedFact): NewFact | null {
 
   return {
     domain,
-    fact: raw.fact.trim(),
+    fact: factText,
     confidence: validConfidence,
     source: 'inferred',
   };
