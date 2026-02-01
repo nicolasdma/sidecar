@@ -110,6 +110,9 @@ function getDatabase(): Database.Database {
   db = new Database(dbPath);
   db.exec(SCHEMA);
 
+  // Enable WAL mode for crash safety (per memory-architecture.md §9)
+  db.exec('PRAGMA journal_mode=WAL;');
+
   logger.info(`Database initialized: ${dbPath}`);
   return db;
 }
@@ -143,7 +146,10 @@ export function saveMessage(message: Message): number {
   return Number(result.lastInsertRowid);
 }
 
-export function loadHistory(limit: number = 50): Message[] {
+// Default window size per memory-architecture.md §9 Phase 1
+const DEFAULT_WINDOW_SIZE = 6;
+
+export function loadHistory(limit: number = DEFAULT_WINDOW_SIZE): Message[] {
   const database = getDatabase();
 
   const stmt = database.prepare(`

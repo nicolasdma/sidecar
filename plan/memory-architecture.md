@@ -2248,6 +2248,121 @@ async function callMemoryAgent(prompt: string, retries = 2): Promise<object> {
 
 ---
 
+## 18. Code Review: Spec vs Implementation
+
+> Análisis de discrepancias entre este documento y el código actual.
+> Fecha: 2025-01-31
+
+### 18.1 Discrepancias Identificadas
+
+| # | Spec (este documento) | Implementación Actual | Estado | Acción |
+|---|----------------------|----------------------|--------|--------|
+| 1 | Window = 6 turnos | `loadHistory(50)` | ✅ FIXED | Cambiado a `DEFAULT_WINDOW_SIZE = 6` |
+| 2 | SQLite WAL mode | No configurado | ✅ FIXED | Agregado `PRAGMA journal_mode=WAL;` |
+| 3 | Facts en SQLite table | Facts en `learnings.md` | ⚠️ DEVIATION | Documentado, migrar en Fase 2 |
+| 4 | Keyword filtering top-5 | Usa todos los facts | ⚠️ ACCEPTABLE | Diferir a Fase 2 (pocos facts por ahora) |
+| 5 | `/facts` command | No implementado | ⚠️ ACCEPTABLE | Usuario puede leer `learnings.md` |
+| 6 | Token budget 4000 | No enforced | ⚠️ ACCEPTABLE | Window de 6 turnos provee cap implícito |
+
+### 18.2 Fixes Aplicados
+
+#### Fix 1: Window Size (MUST FIX)
+
+```typescript
+// src/memory/store.ts
+// ANTES
+export function loadHistory(limit: number = 50): Message[] {
+
+// DESPUÉS
+const DEFAULT_WINDOW_SIZE = 6; // Per memory-architecture.md §9 Phase 1
+export function loadHistory(limit: number = DEFAULT_WINDOW_SIZE): Message[] {
+```
+
+#### Fix 2: WAL Mode (SHOULD FIX)
+
+```typescript
+// src/memory/store.ts línea 111
+db.exec(SCHEMA);
+db.exec('PRAGMA journal_mode=WAL;'); // AGREGADO
+```
+
+### 18.3 Desviación Intencional: Markdown vs SQLite
+
+**Spec dice:** Facts en tabla SQLite con schema estructurado.
+
+**Implementación usa:** Archivo `learnings.md` con formato Markdown.
+
+**Justificación:**
+- Human-readable para debugging
+- Editable manualmente por el usuario
+- Suficiente para Phase 1 con pocos facts
+- No requiere queries complejas todavía
+
+**Plan de migración (Fase 2):**
+1. Crear tabla `facts` en SQLite
+2. Migrar facts de `learnings.md` a SQLite
+3. Mantener `learnings.md` como backup human-readable
+4. knowledge.ts lee de SQLite, escribe a ambos
+
+### 18.4 Riesgos Aceptados para Phase 1
+
+| Riesgo | Por qué es aceptable | Trigger para reconsiderar |
+|--------|---------------------|---------------------------|
+| No keyword filtering | Pocos facts (~10-20) caben en prompt | Usuario tiene 50+ facts |
+| No `/facts` command | Usuario puede leer archivo directamente | Feedback de usuarios |
+| Explicit-only storage | Evita false positives | Muchos "recordá que" olvidados |
+| No token budget check | Window de 6 + facts limitados = implícito | Errores de API por tokens |
+
+### 18.5 Monitoreo Post-Ship
+
+Métricas a trackear después de shipping Phase 1:
+
+```
+1. Conteo de facts por usuario
+   → Si > 50: implementar keyword filtering urgente
+
+2. Frecuencia de "recordá" vs facts guardados
+   → Si ratio < 30%: explicit-only es muy restrictivo
+
+3. Token count por request (agregar logging)
+   → Si promedio > 3000: revisar budgets
+
+4. Eventos de crash recovery (.tmp files)
+   → Si > 0: investigar causa
+
+5. Tiempo de respuesta
+   → Si degradación: revisar window size
+```
+
+### 18.6 Veredicto de Código
+
+```
+┌────────────────────────────────────────────────────────────┐
+│              CODE REVIEW: ✅ READY TO SHIP                 │
+├────────────────────────────────────────────────────────────┤
+│                                                            │
+│  FIXES APLICADOS:                                         │
+│  ✅ Window size: 50 → 6                                   │
+│  ✅ WAL mode: habilitado                                  │
+│                                                            │
+│  DESVIACIONES DOCUMENTADAS:                               │
+│  📝 Markdown vs SQLite para facts (intencional)          │
+│  📝 Sin keyword filtering (aceptable para MVP)            │
+│                                                            │
+│  RIESGOS ACEPTADOS:                                       │
+│  ⚠️ Sin /facts command (leer archivo es workaround)       │
+│  ⚠️ Sin token budget check (window provee cap)            │
+│                                                            │
+│  PRÓXIMOS PASOS:                                          │
+│  → Ship Phase 1                                           │
+│  → Monitorear métricas post-launch                        │
+│  → Memory Agent en Fase 2                                 │
+│                                                            │
+└────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## Referencias
 
 - Arquitectura diseñada para uso diario continuo
