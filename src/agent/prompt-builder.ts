@@ -171,18 +171,20 @@ Guardá los facts de forma concisa, ej: "Es alérgico al maní", "Trabaja como d
 
 /**
  * Construye el system prompt de forma asíncrona.
- * Incluye SOUL.md + knowledge (user.md + learnings.md) + contexto temporal.
+ * Incluye SOUL.md + knowledge (user.md + facts) + contexto temporal.
  * Issue #8: Knowledge is sanitized and wrapped in unique delimiters.
+ *
+ * @param userQuery - Optional user query for keyword-based fact filtering
  */
-export async function buildSystemPrompt(): Promise<string> {
+export async function buildSystemPrompt(userQuery?: string): Promise<string> {
   const soul = loadSoul();
   const timeContext = getCurrentTimeContext();
   const memoryInstructions = getMemoryInstructions();
 
-  // Cargar knowledge (user.md + learnings.md)
+  // Cargar knowledge (user.md + SQLite facts)
   let knowledgeSection = '';
   try {
-    const knowledge = await loadKnowledge();
+    const knowledge = await loadKnowledge(userQuery);
     if (knowledge.trim()) {
       // Issue #8: Sanitize knowledge to prevent prompt injection
       const { sanitized } = sanitizeKnowledge(knowledge);

@@ -57,6 +57,24 @@ const SCHEMA = `
     content TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_spontaneous_sent_at ON spontaneous_messages(sent_at);
+
+  -- Facts table for SQLite-based memory (Fase 1 Memory Architecture)
+  CREATE TABLE IF NOT EXISTS facts (
+    id TEXT PRIMARY KEY,
+    domain TEXT NOT NULL CHECK (domain IN ('work', 'preferences', 'decisions', 'personal', 'projects', 'health', 'relationships', 'schedule', 'goals', 'general')),
+    fact TEXT NOT NULL,
+    confidence TEXT NOT NULL CHECK (confidence IN ('high', 'medium', 'low')) DEFAULT 'medium',
+    scope TEXT NOT NULL CHECK (scope IN ('global', 'project', 'session')) DEFAULT 'global',
+    supersedes TEXT REFERENCES facts(id),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_confirmed_at TEXT NOT NULL DEFAULT (datetime('now')),
+    source TEXT NOT NULL CHECK (source IN ('explicit', 'inferred', 'migrated')) DEFAULT 'explicit',
+    stale INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE INDEX IF NOT EXISTS idx_facts_domain ON facts(domain);
+  CREATE INDEX IF NOT EXISTS idx_facts_last_confirmed ON facts(last_confirmed_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_facts_stale ON facts(stale);
 `;
 
 interface MessageRow {
@@ -66,6 +84,27 @@ interface MessageRow {
   tool_calls: string | null;
   tool_call_id: string | null;
   created_at: string;
+}
+
+// ============= Fact Types (Fase 1 Memory Architecture) =============
+
+export type FactDomain = 'work' | 'preferences' | 'decisions' | 'personal' | 'projects' | 'health' | 'relationships' | 'schedule' | 'goals' | 'general';
+export type FactConfidence = 'high' | 'medium' | 'low';
+export type FactScope = 'global' | 'project' | 'session';
+export type FactSource = 'explicit' | 'inferred' | 'migrated';
+
+export interface FactRow {
+  id: string;
+  domain: FactDomain;
+  fact: string;
+  confidence: FactConfidence;
+  scope: FactScope;
+  supersedes: string | null;
+  created_at: string;
+  last_confirmed_at: string;
+  source: FactSource;
+  stale: number;
+  archived: number;
 }
 
 let db: Database.Database | null = null;
@@ -83,7 +122,7 @@ function isConnectionHealthy(database: Database.Database): boolean {
   }
 }
 
-function getDatabase(): Database.Database {
+export function getDatabase(): Database.Database {
   // Issue #10: Check if existing connection is healthy
   if (db) {
     if (isConnectionHealthy(db)) {

@@ -1,7 +1,7 @@
 # Plan: AI Agent Companion (Nuevo Proyecto)
 
-> Estado: ✅ FASE 3 COMPLETADA | 📋 FASE 4 LISTA PARA IMPLEMENTAR
-> Última actualización: 2026-01-31 (actualización 19)
+> Estado: ✅ FASE 3 COMPLETADA | ✅ MEMORY ARCHITECTURE FASE 1 COMPLETADA
+> Última actualización: 2026-02-01 (actualización 20)
 
 ---
 
@@ -4594,6 +4594,55 @@ Análisis arquitectónico realizado ANTES de comenzar Fase 4 para asegurar que l
 ---
 
 ## Changelog
+
+### 2026-02-01 (actualización 20) - Memory Architecture FASE 1 COMPLETADA
+
+**Implementación completa de la nueva arquitectura de memoria SQLite-based.**
+
+Basado en `plan/memory-architecture.md`, se implementó FASE 1 (Foundation MVP):
+
+**Archivos creados:**
+- `src/memory/facts-store.ts` - CRUD operations para facts en SQLite
+  - `saveFact()`, `getFacts()`, `getFactsByDomain()`, `updateFactConfirmation()`
+  - `markFactStale()`, `supersedeFact()`, `deleteFact()`, `getFactById()`
+  - `filterFactsByKeywords()` - keyword matching con stopwords
+  - `getHealthFacts()`, `getFactsStats()`, `getTotalFactsCount()`
+- `src/memory/facts-migration.ts` - Migration de learnings.md a SQLite
+  - `migrateFromLearningsMd()` - one-time migration con preservación de fechas
+  - `syncToLearningsMd()` - sync back para backup/readability
+  - `ensureMigration()` - auto-migration al iniciar
+
+**Archivos modificados:**
+- `src/memory/store.ts` - Agregado schema de tabla `facts` con:
+  - Domains: work, preferences, decisions, personal, projects, health, relationships, schedule, goals, general
+  - Confidence levels: high, medium, low
+  - Scopes: global, project, session
+  - Sources: explicit, inferred, migrated
+  - Indexes para domain, last_confirmed_at, stale
+  - Exportado `getDatabase()` y tipos `FactRow`, `FactDomain`, etc.
+- `src/interfaces/command-handler.ts` - Nuevos comandos:
+  - `/remember "fact"` - guardar facts explícitamente con detección automática de dominio
+  - `/facts [domain]` - listar facts por dominio o ver resumen
+  - Actualizado `/help` con documentación de nuevos comandos
+- `src/memory/knowledge.ts` - SQLite-based loading:
+  - `loadKnowledge(userQuery?)` - ahora usa SQLite con keyword filtering
+  - `formatFactsForPrompt(userQuery?)` - formatea facts para prompt
+  - `loadKnowledgeLegacy()` - mantiene soporte file-based para migration
+- `src/agent/prompt-builder.ts` - Keyword filtering:
+  - `buildSystemPrompt(userQuery?)` - acepta query para filtrar facts relevantes
+
+**Mappings implementados:**
+- Category → Domain: Health→health, Preferences→preferences, Work→work, etc.
+- Weight → Confidence: ≥7→high, ≥4→medium, <4→low
+
+**Verificación:**
+- ✅ TypeScript compila sin errores
+- ✅ Build exitoso
+- ✅ Migration preserva fechas originales (learned, confirmed)
+- ✅ Health facts siempre incluidos en prompt
+- ✅ Keyword filtering funciona con stopwords
+
+---
 
 ### 2026-01-31 (actualización 18) - Review Final FASE 3 (3 Perspectivas Profundizado)
 

@@ -1,9 +1,12 @@
 /**
- * Knowledge management: user.md + learnings.md
+ * Knowledge management: user.md + SQLite facts
  *
  * Implementa el sistema de memoria persistente híbrido (Tier 1).
  * - user.md: Perfil del usuario (editable manualmente)
- * - learnings.md: Facts aprendidos por el agente
+ * - SQLite facts: Facts aprendidos por el agente (Fase 1 Memory Architecture)
+ *
+ * Legacy support:
+ * - learnings.md: Kept for migration and human-readable backup
  */
 
 import { readFile, writeFile, rename, mkdir, unlink } from 'fs/promises';
@@ -24,6 +27,13 @@ import {
   getTodayDate,
 } from './fact-parser.js';
 import { extractSignificantWords } from './stopwords.js';
+import {
+  getFacts,
+  getHealthFacts,
+  filterFactsByKeywords,
+  type StoredFact,
+} from './facts-store.js';
+import { ensureMigration } from './facts-migration.js';
 
 const log = createLogger('knowledge');
 
@@ -126,9 +136,28 @@ export async function loadLearnings(): Promise<ParseResult> {
 }
 
 /**
- * Carga todo el knowledge (user + learnings) como string para el prompt.
+ * Carga todo el knowledge (user + facts) como string para el prompt.
+ * Uses SQLite-based facts storage (Fase 1 Memory Architecture).
+ *
+ * @param userQuery - Optional user query for keyword-based filtering
  */
-export async function loadKnowledge(): Promise<string> {
+export async function loadKnowledge(userQuery?: string): Promise<string> {
+  // Ensure migration has been run
+  await ensureMigration();
+
+  const userProfile = await loadUserProfile();
+
+  // Get facts from SQLite, optionally filtered by query
+  const factsFormatted = formatFactsForPrompt(userQuery);
+
+  return `${userProfile}\n\n${factsFormatted}`;
+}
+
+/**
+ * Legacy function: loads knowledge from file-based storage.
+ * Used during migration and as fallback.
+ */
+export async function loadKnowledgeLegacy(): Promise<string> {
   const [userProfile, learningsResult] = await Promise.all([
     loadUserProfile(),
     loadLearnings(),
@@ -141,7 +170,78 @@ export async function loadKnowledge(): Promise<string> {
 }
 
 /**
- * Formatea facts para incluir en el prompt.
+ * Formats SQLite-based facts for the prompt.
+ * Always includes health facts, then adds relevant facts based on query.
+ *
+ * @param userQuery - Optional query for keyword-based filtering
+ * @param maxTokens - Token budget for facts section
+ */
+export function formatFactsForPrompt(
+  userQuery?: string,
+  maxTokens: number = TOKEN_BUDGETS.MAX_LEARNINGS_TOKENS
+): string {
+  // Always get health facts
+  const healthFacts = getHealthFacts();
+
+  // Get relevant facts based on query, or recent facts if no query
+  let relevantFacts: StoredFact[];
+  if (userQuery && userQuery.trim()) {
+    relevantFacts = filterFactsByKeywords(userQuery, 20);
+    // Filter out health facts from relevant (we already have them)
+    relevantFacts = relevantFacts.filter(f => f.domain !== 'health');
+  } else {
+    // No query - get most recent non-health facts
+    relevantFacts = getFacts({ limit: 20 }).filter(f => f.domain !== 'health');
+  }
+
+  if (healthFacts.length === 0 && relevantFacts.length === 0) {
+    return '';
+  }
+
+  // Format health facts (never truncate)
+  const healthLines = healthFacts.map(f => `- ${f.fact}`);
+  let currentTokens = estimateTokens(healthLines.join('\n'));
+
+  // Add relevant facts up to token limit
+  const includedRelevant: string[] = [];
+  let truncatedCount = 0;
+
+  for (const fact of relevantFacts) {
+    const line = `- ${fact.fact}`;
+    const lineTokens = estimateTokens(line);
+
+    if (currentTokens + lineTokens > maxTokens) {
+      truncatedCount++;
+      continue;
+    }
+
+    includedRelevant.push(line);
+    currentTokens += lineTokens;
+  }
+
+  // Build output
+  let output = '# Lo que sé sobre vos\n\n';
+
+  if (healthFacts.length > 0) {
+    output += '## Salud (importante)\n';
+    output += healthLines.join('\n') + '\n\n';
+  }
+
+  if (includedRelevant.length > 0) {
+    output += '## Otros datos\n';
+    output += includedRelevant.join('\n') + '\n';
+  }
+
+  if (truncatedCount > 0) {
+    output += `\n(Hay ${truncatedCount} facts adicionales en archivo)`;
+    log.info(`Truncated ${truncatedCount} facts from prompt`);
+  }
+
+  return output;
+}
+
+/**
+ * Formatea facts (legacy file-based) para incluir en el prompt.
  * Ordena por score y trunca si es necesario.
  * Issue #6: Uses centralized token estimation.
  */
