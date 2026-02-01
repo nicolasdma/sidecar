@@ -70,16 +70,60 @@ USER MESSAGE: `;
  * Parses the LLM response into a ClassificationResult.
  * Handles malformed JSON gracefully.
  */
+/**
+ * Extracts the first balanced JSON object from a string.
+ * Handles nested objects correctly by counting braces.
+ */
+function extractFirstJsonObject(raw: string): string | null {
+  const start = raw.indexOf('{');
+  if (start === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+
+  for (let i = start; i < raw.length; i++) {
+    const char = raw[i];
+
+    if (escape) {
+      escape = false;
+      continue;
+    }
+
+    if (char === '\\' && inString) {
+      escape = true;
+      continue;
+    }
+
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) continue;
+
+    if (char === '{') depth++;
+    if (char === '}') {
+      depth--;
+      if (depth === 0) {
+        return raw.slice(start, i + 1);
+      }
+    }
+  }
+
+  return null; // Unbalanced braces
+}
+
 function parseClassificationResponse(raw: string): Partial<ClassificationResult> {
   try {
-    // Try to extract JSON from response
-    const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
+    // Extract first balanced JSON object (handles nested params correctly)
+    const jsonStr = extractFirstJsonObject(raw);
+    if (!jsonStr) {
       logger.warn('No JSON found in classification response', { raw: raw.slice(0, 200) });
       return { intent: 'unknown', confidence: 0 };
     }
 
-    const parsed = JSON.parse(jsonMatch[0]) as {
+    const parsed = JSON.parse(jsonStr) as {
       intent?: string;
       confidence?: number;
       params?: Record<string, string>;

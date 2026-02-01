@@ -364,6 +364,10 @@ export function getDatabase(): Database.Database {
   // Enable WAL mode for crash safety (per memory-architecture.md §9)
   db.exec('PRAGMA journal_mode=WAL;');
 
+  // Enable foreign key enforcement (required for ON DELETE CASCADE to work)
+  // SQLite has foreign keys disabled by default for historical compatibility
+  db.exec('PRAGMA foreign_keys = ON;');
+
   // Fase 2: Run migrations for new columns
   runFase2Migrations(db);
 
