@@ -14,6 +14,8 @@ import {
 import { saveMessage, loadHistory } from '../memory/store.js';
 import { queueForExtraction } from '../memory/extraction-service.js';
 import { createLogger } from '../utils/logger.js';
+import { config } from '../utils/config.js';
+import { getLocalRouter, type LocalRouter } from './local-router/index.js';
 
 const logger = createLogger('brain');
 
@@ -41,11 +43,17 @@ export class Brain {
   private maxToolIterations: number;
   private maxContextTokens: number;
   private initialized: boolean = false;
+  private localRouter: LocalRouter | null = null;
 
-  constructor(config?: BrainConfig) {
+  constructor(brainConfig?: BrainConfig) {
     this.client = createKimiClient();
-    this.maxToolIterations = config?.maxToolIterations ?? MAX_TOOL_ITERATIONS;
-    this.maxContextTokens = config?.maxContextTokens ?? 100000;
+    this.maxToolIterations = brainConfig?.maxToolIterations ?? MAX_TOOL_ITERATIONS;
+    this.maxContextTokens = brainConfig?.maxContextTokens ?? 100000;
+
+    // Fase 3.5: Initialize LocalRouter if enabled
+    if (config.localRouter.enabled) {
+      this.localRouter = getLocalRouter(config.localRouter);
+    }
   }
 
   private initialize(): void {
@@ -84,6 +92,48 @@ export class Brain {
       mode: isProactiveMode ? 'proactive' : 'reactive',
       proactiveContext: options.proactiveContext,
     });
+
+    // Fase 3.5: Pre-Brain routing (only for user messages, not proactive mode)
+    // INVARIANTE: Proactive mode ALWAYS bypasses LocalRouter
+    if (
+      !isProactiveMode &&
+      options.userInput &&
+      this.localRouter &&
+      config.localRouter.enabled
+    ) {
+      const routingResult = await this.localRouter.tryRoute(options.userInput);
+
+      if (routingResult.route === 'DIRECT_TOOL') {
+        const execResult = await this.localRouter.executeDirect(
+          routingResult.intent,
+          routingResult.params || {}
+        );
+
+        if (execResult.success) {
+          // Save with SAME format as agentic loop
+          this.saveDirectResponse(options.userInput, execResult.response);
+
+          logger.info('Direct execution successful', {
+            intent: routingResult.intent,
+            latency_ms: execResult.latencyMs,
+          });
+
+          return execResult.response;
+        }
+
+        // Tool failed -> fallback to Brain WITH CONTEXT
+        this.localRouter.recordFallback();
+        logger.warn('Direct execution failed, falling back to Brain', {
+          intent: routingResult.intent,
+          error: execResult.error,
+        });
+
+        // Continue to agentic loop - the message will be saved below
+        // Note: We don't pass previous attempt context yet (could be added later)
+      }
+
+      // ROUTE_TO_LLM -> continue to agentic loop
+    }
 
     // Issue #7: Only save user message if there's actual user input
     let lastMessageId: number | null = null;
@@ -242,6 +292,33 @@ export class Brain {
 
   getHistory(): Message[] {
     return loadHistory();
+  }
+
+  /**
+   * Fase 3.5: Save direct response with SAME format as agentic loop.
+   * This ensures history consistency between direct and agentic paths.
+   */
+  private saveDirectResponse(userInput: string, response: string): void {
+    // Save user message
+    const userMessage: UserMessage = {
+      role: 'user',
+      content: userInput,
+    };
+    const messageId = saveMessage(userMessage);
+
+    // Queue for async fact extraction (fire-and-forget)
+    queueForExtraction(messageId, userInput, 'user').catch(err => {
+      logger.warn('Failed to queue extraction for direct response', {
+        error: err instanceof Error ? err.message : err,
+      });
+    });
+
+    // Save assistant response
+    const assistantMessage: AssistantMessage = {
+      role: 'assistant',
+      content: response,
+    };
+    saveMessage(assistantMessage);
   }
 
   /**

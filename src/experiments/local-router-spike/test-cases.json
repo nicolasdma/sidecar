@@ -1,0 +1,429 @@
+{
+  "description": "Test cases for Local Router intent classification",
+  "version": "1.0",
+  "cases": [
+    {
+      "id": 1,
+      "input": "Recordame en 10 minutos de las pastas",
+      "expected": {
+        "intent": "reminder",
+        "route": "DIRECT_TOOL",
+        "params": { "time": "en 10 minutos", "message": "las pastas" }
+      }
+    },
+    {
+      "id": 2,
+      "input": "Qué hora es?",
+      "expected": {
+        "intent": "time",
+        "route": "DIRECT_TOOL"
+      }
+    },
+    {
+      "id": 3,
+      "input": "Hora actual",
+      "expected": {
+        "intent": "time",
+        "route": "DIRECT_TOOL"
+      }
+    },
+    {
+      "id": 4,
+      "input": "Decime la hora",
+      "expected": {
+        "intent": "time",
+        "route": "DIRECT_TOOL"
+      }
+    },
+    {
+      "id": 5,
+      "input": "Clima en Buenos Aires",
+      "expected": {
+        "intent": "weather",
+        "route": "DIRECT_TOOL",
+        "params": { "location": "Buenos Aires" }
+      }
+    },
+    {
+      "id": 6,
+      "input": "Cómo está el tiempo en Córdoba?",
+      "expected": {
+        "intent": "weather",
+        "route": "DIRECT_TOOL",
+        "params": { "location": "Córdoba" }
+      }
+    },
+    {
+      "id": 7,
+      "input": "Qué recordatorios tengo?",
+      "expected": {
+        "intent": "list_reminders",
+        "route": "DIRECT_TOOL"
+      }
+    },
+    {
+      "id": 8,
+      "input": "Mostrame mis recordatorios",
+      "expected": {
+        "intent": "list_reminders",
+        "route": "DIRECT_TOOL"
+      }
+    },
+    {
+      "id": 9,
+      "input": "Avisame mañana a las 9 de llamar al banco",
+      "expected": {
+        "intent": "reminder",
+        "route": "DIRECT_TOOL",
+        "params": { "time": "mañana a las 9", "message": "llamar al banco" }
+      }
+    },
+    {
+      "id": 10,
+      "input": "Recordame en 2 horas de tomar la medicina",
+      "expected": {
+        "intent": "reminder",
+        "route": "DIRECT_TOOL",
+        "params": { "time": "en 2 horas", "message": "tomar la medicina" }
+      }
+    },
+    {
+      "id": 11,
+      "input": "Poneme un recordatorio para las 15:00 de la reunión",
+      "expected": {
+        "intent": "reminder",
+        "route": "DIRECT_TOOL",
+        "params": { "time": "las 15:00", "message": "la reunión" }
+      }
+    },
+    {
+      "id": 12,
+      "input": "Cancela el recordatorio de las pastas",
+      "expected": {
+        "intent": "cancel_reminder",
+        "route": "DIRECT_TOOL",
+        "params": { "query": "pastas" }
+      }
+    },
+    {
+      "id": 13,
+      "input": "Borra el reminder del banco",
+      "expected": {
+        "intent": "cancel_reminder",
+        "route": "DIRECT_TOOL",
+        "params": { "query": "banco" }
+      }
+    },
+    {
+      "id": 14,
+      "input": "Hola, cómo estás?",
+      "expected": {
+        "intent": "conversation",
+        "route": "ROUTE_TO_LLM"
+      }
+    },
+    {
+      "id": 15,
+      "input": "Buenas tardes",
+      "expected": {
+        "intent": "conversation",
+        "route": "ROUTE_TO_LLM"
+      }
+    },
+    {
+      "id": 16,
+      "input": "Che, qué onda?",
+      "expected": {
+        "intent": "conversation",
+        "route": "ROUTE_TO_LLM"
+      }
+    },
+    {
+      "id": 17,
+      "input": "Qué es la fotosíntesis?",
+      "expected": {
+        "intent": "question",
+        "route": "ROUTE_TO_LLM"
+      }
+    },
+    {
+      "id": 18,
+      "input": "Explicame cómo funciona JavaScript",
+      "expected": {
+        "intent": "question",
+        "route": "ROUTE_TO_LLM"
+      }
+    },
+    {
+      "id": 19,
+      "input": "Cuál es la capital de Francia?",
+      "expected": {
+        "intent": "question",
+        "route": "ROUTE_TO_LLM"
+      }
+    },
+    {
+      "id": 20,
+      "input": "Pastas",
+      "expected": {
+        "intent": "ambiguous",
+        "route": "ROUTE_TO_LLM"
+      }
+    },
+    {
+      "id": 21,
+      "input": "Mañana",
+      "expected": {
+        "intent": "ambiguous",
+        "route": "ROUTE_TO_LLM"
+      }
+    },
+    {
+      "id": 22,
+      "input": "Ok",
+      "expected": {
+        "intent": "conversation",
+        "route": "ROUTE_TO_LLM"
+      }
+    },
+    {
+      "id": 23,
+      "input": "Gracias!",
+      "expected": {
+        "intent": "conversation",
+        "route": "ROUTE_TO_LLM"
+      }
+    },
+    {
+      "id": 24,
+      "input": "Recordame",
+      "expected": {
+        "intent": "ambiguous",
+        "route": "ROUTE_TO_LLM"
+      },
+      "note": "Incompleto - falta tiempo y mensaje"
+    },
+    {
+      "id": 25,
+      "input": "Qué hora es y recordame de llamar a mamá en 1 hora",
+      "expected": {
+        "intent": "multi_intent",
+        "route": "ROUTE_TO_LLM"
+      },
+      "note": "Múltiples intents - requiere Kimi"
+    },
+    {
+      "id": 26,
+      "input": "Recordame que soy alérgico al maní",
+      "expected": {
+        "intent": "fact_memory",
+        "route": "ROUTE_TO_LLM"
+      },
+      "note": "'Recordame' pero es un fact, no un reminder temporal"
+    },
+    {
+      "id": 27,
+      "input": "No me recuerdes nada",
+      "expected": {
+        "intent": "conversation",
+        "route": "ROUTE_TO_LLM"
+      },
+      "note": "Negación"
+    },
+    {
+      "id": 28,
+      "input": "Tenés algún recordatorio pendiente?",
+      "expected": {
+        "intent": "list_reminders",
+        "route": "DIRECT_TOOL"
+      }
+    },
+    {
+      "id": 29,
+      "input": "Dame el pronóstico del tiempo",
+      "expected": {
+        "intent": "weather",
+        "route": "DIRECT_TOOL"
+      },
+      "note": "Sin ubicación - usará default"
+    },
+    {
+      "id": 30,
+      "input": "Va a llover hoy?",
+      "expected": {
+        "intent": "weather",
+        "route": "DIRECT_TOOL"
+      }
+    },
+    {
+      "id": 31,
+      "input": "Avisame cuando sean las 5",
+      "expected": {
+        "intent": "reminder",
+        "route": "DIRECT_TOOL",
+        "params": { "time": "las 5", "message": "aviso de hora" }
+      }
+    },
+    {
+      "id": 32,
+      "input": "Búscame información sobre React",
+      "expected": {
+        "intent": "search",
+        "route": "ROUTE_TO_LLM"
+      },
+      "note": "Web search - requiere Kimi para decidir qué buscar"
+    },
+    {
+      "id": 33,
+      "input": "Qué opinás del cambio climático?",
+      "expected": {
+        "intent": "question",
+        "route": "ROUTE_TO_LLM"
+      },
+      "note": "Pregunta de opinión"
+    },
+    {
+      "id": 34,
+      "input": "Contame un chiste",
+      "expected": {
+        "intent": "conversation",
+        "route": "ROUTE_TO_LLM"
+      }
+    },
+    {
+      "id": 35,
+      "input": "Qué día es hoy?",
+      "expected": {
+        "intent": "time",
+        "route": "DIRECT_TOOL"
+      },
+      "note": "Fecha también usa get_current_time"
+    },
+    {
+      "id": 36,
+      "input": "En qué mes estamos?",
+      "expected": {
+        "intent": "time",
+        "route": "DIRECT_TOOL"
+      }
+    },
+    {
+      "id": 37,
+      "input": "Recordame hoy a las 18 de ir al gym",
+      "expected": {
+        "intent": "reminder",
+        "route": "DIRECT_TOOL",
+        "params": { "time": "hoy a las 18", "message": "ir al gym" }
+      }
+    },
+    {
+      "id": 38,
+      "input": "Elimina todos mis recordatorios",
+      "expected": {
+        "intent": "cancel_reminder",
+        "route": "ROUTE_TO_LLM"
+      },
+      "note": "Acción masiva - requiere confirmación via Kimi"
+    },
+    {
+      "id": 39,
+      "input": "Hace frío afuera?",
+      "expected": {
+        "intent": "weather",
+        "route": "DIRECT_TOOL"
+      }
+    },
+    {
+      "id": 40,
+      "input": "Necesito paraguas hoy?",
+      "expected": {
+        "intent": "weather",
+        "route": "DIRECT_TOOL"
+      }
+    },
+    {
+      "id": 41,
+      "input": "Ayudame a escribir un email",
+      "expected": {
+        "intent": "task",
+        "route": "ROUTE_TO_LLM"
+      }
+    },
+    {
+      "id": 42,
+      "input": "Podés ayudarme con algo?",
+      "expected": {
+        "intent": "conversation",
+        "route": "ROUTE_TO_LLM"
+      }
+    },
+    {
+      "id": 43,
+      "input": "Lista de recordatorios",
+      "expected": {
+        "intent": "list_reminders",
+        "route": "DIRECT_TOOL"
+      }
+    },
+    {
+      "id": 44,
+      "input": "Quiero ver mis reminders",
+      "expected": {
+        "intent": "list_reminders",
+        "route": "DIRECT_TOOL"
+      }
+    },
+    {
+      "id": 45,
+      "input": "Poné una alarma para las 7",
+      "expected": {
+        "intent": "reminder",
+        "route": "DIRECT_TOOL",
+        "params": { "time": "las 7", "message": "alarma" }
+      },
+      "note": "Alarma = reminder"
+    },
+    {
+      "id": 46,
+      "input": "Temperatura actual",
+      "expected": {
+        "intent": "weather",
+        "route": "DIRECT_TOOL"
+      }
+    },
+    {
+      "id": 47,
+      "input": "Cuántos grados hay?",
+      "expected": {
+        "intent": "weather",
+        "route": "DIRECT_TOOL"
+      }
+    },
+    {
+      "id": 48,
+      "input": "Deberías recordarme de algo importante",
+      "expected": {
+        "intent": "conversation",
+        "route": "ROUTE_TO_LLM"
+      },
+      "note": "No es un comando de reminder"
+    },
+    {
+      "id": 49,
+      "input": "Recordatorio para el lunes: entregar informe",
+      "expected": {
+        "intent": "reminder",
+        "route": "DIRECT_TOOL",
+        "params": { "time": "el lunes", "message": "entregar informe" }
+      }
+    },
+    {
+      "id": 50,
+      "input": "Chau, hasta mañana",
+      "expected": {
+        "intent": "conversation",
+        "route": "ROUTE_TO_LLM"
+      }
+    }
+  ]
+}

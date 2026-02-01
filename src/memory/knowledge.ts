@@ -46,6 +46,21 @@ const KNOWLEDGE_DIR = config.paths.knowledge;
 const USER_MD_PATH = config.paths.userMd;
 const LEARNINGS_MD_PATH = config.paths.learningsMd;
 
+/**
+ * Fase 3 Fixes: Track which search mode was used for the last query.
+ * Useful for debugging and understanding system behavior.
+ */
+export type SearchMode = 'hybrid' | 'keyword' | 'error_fallback' | 'none';
+let lastSearchMode: SearchMode = 'none';
+
+/**
+ * Returns the search mode used in the last formatFactsForPrompt call.
+ * Useful for debugging and testing.
+ */
+export function getLastSearchMode(): SearchMode {
+  return lastSearchMode;
+}
+
 // Thresholds para deduplicación (Bug 11)
 const DEDUP_THRESHOLD_DEFAULT = 0.70;  // 70% word overlap
 const DEDUP_THRESHOLD_HEALTH = 0.80;   // 80% para Health (más conservador)
@@ -235,8 +250,11 @@ export async function formatFactsForPrompt(
         // Filter out health facts (already have them) and apply decay
         const nonHealth = rawRelevant.filter(f => f.domain !== 'health');
         relevantFacts = filterByDecay(nonHealth, 0.8);
+        lastSearchMode = 'hybrid';
+        log.debug('Using hybrid search', { factsFound: relevantFacts.length });
       } catch (error) {
         // Fallback to keyword search
+        lastSearchMode = 'error_fallback';
         log.warn('Hybrid search failed, using keyword fallback', {
           error: error instanceof Error ? error.message : 'Unknown',
         });
@@ -246,12 +264,15 @@ export async function formatFactsForPrompt(
       }
     } else {
       // Fase 2 fallback: keyword search only
+      lastSearchMode = 'keyword';
+      log.debug('Using keyword search (embeddings not ready)');
       const rawRelevant = filterFactsByKeywords(userQuery, 30);
       const nonHealth = rawRelevant.filter(f => f.domain !== 'health');
       relevantFacts = filterByDecay(nonHealth, 0.8);
     }
   } else {
     // No query - get most recent non-health facts
+    lastSearchMode = 'none';
     const rawFacts = getFacts({ limit: 30 }).filter(f => f.domain !== 'health');
     // No query means no specific relevance - stricter decay filtering
     relevantFacts = filterByDecay(rawFacts);

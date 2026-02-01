@@ -60,7 +60,11 @@ export async function checkOllamaAvailability(): Promise<{ available: boolean; m
 
     const data = await response.json() as { models?: Array<{ name: string }> };
     const models = data.models || [];
-    const hasModel = models.some(m => m.name.startsWith(MEMORY_MODEL.split(':')[0] || ''));
+    // Validate exact model name, not just prefix
+    // Accept both "model" and "model:latest" formats
+    const hasModel = models.some(
+      m => m.name === MEMORY_MODEL || m.name === `${MEMORY_MODEL}:latest`
+    );
 
     if (!hasModel) {
       return {

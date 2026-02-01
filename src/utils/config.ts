@@ -80,6 +80,17 @@ export const config = {
     // Database
     database: join(dataDir, 'memory.db'),
   },
+  // Fase 3.5: LocalRouter configuration
+  localRouter: {
+    /** Feature flag to enable/disable LocalRouter */
+    enabled: process.env.LOCAL_ROUTER_ENABLED !== 'false',
+    /** Minimum confidence for direct tool execution */
+    confidenceThreshold: parseFloat(process.env.LOCAL_ROUTER_CONFIDENCE || '0.8'),
+    /** Timeout for Ollama requests in ms */
+    ollamaTimeout: parseInt(process.env.LOCAL_ROUTER_TIMEOUT || '30000', 10),
+    /** Max latency before bypassing to Brain in ms */
+    maxLatencyBeforeBypass: parseInt(process.env.LOCAL_ROUTER_MAX_LATENCY || '2000', 10),
+  },
 } as const;
 
 export function validateConfig(): void {

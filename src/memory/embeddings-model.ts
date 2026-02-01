@@ -59,6 +59,11 @@ interface ProgressInfo {
 }
 
 /**
+ * Tracks whether we've shown download progress to avoid duplicate messages.
+ */
+let downloadProgressShown = false;
+
+/**
  * Lazily loads the embedding model on first use.
  * Implements exponential backoff for repeated failures.
  *
@@ -97,10 +102,30 @@ async function ensureModelLoaded(): Promise<void> {
       // Dynamic import of transformers.js
       const { pipeline } = await import('@xenova/transformers');
 
+      // Show user-friendly download message on first run
+      let isDownloading = false;
+
       embeddingPipeline = await pipeline('feature-extraction', config.modelName, {
         quantized: true,
         progress_callback: (progress: ProgressInfo) => {
           if (progress.progress !== undefined) {
+            // First time we see progress, show a helpful message
+            if (!downloadProgressShown && progress.status === 'downloading') {
+              console.log('\n⏳ Downloading embedding model (first time only)...');
+              console.log('   This may take 10-30 seconds.\n');
+              downloadProgressShown = true;
+              isDownloading = true;
+            }
+
+            // Show progress bar for downloads
+            if (progress.status === 'downloading' || progress.status === 'progress') {
+              const percent = Math.round(progress.progress);
+              const filled = Math.floor(percent / 5);
+              const empty = 20 - filled;
+              const bar = '█'.repeat(filled) + '░'.repeat(empty);
+              process.stdout.write(`\r   [${bar}] ${percent}%`);
+            }
+
             logger.debug('Model download progress', {
               percent: Math.round(progress.progress),
               file: progress.file,
@@ -108,6 +133,11 @@ async function ensureModelLoaded(): Promise<void> {
           }
         },
       });
+
+      // Clear progress line and show completion if we were downloading
+      if (isDownloading) {
+        console.log('\n✓ Embedding model ready.\n');
+      }
 
       const elapsed = Date.now() - startTime;
       logger.info('Embedding model loaded', { elapsed_ms: elapsed });
