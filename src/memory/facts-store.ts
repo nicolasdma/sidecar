@@ -8,6 +8,7 @@
 import { randomUUID } from 'crypto';
 import {
   getDatabase,
+  queueFactForEmbedding,
   type FactRow,
   type FactDomain,
   type FactConfidence,
@@ -17,6 +18,7 @@ import {
 import { extractSignificantWords } from './stopwords.js';
 import { createLogger } from '../utils/logger.js';
 import { getDecayStatus } from './decay-service.js';
+import { isEmbeddingsEnabled } from './embeddings-state.js';
 
 const logger = createLogger('facts-store');
 
@@ -101,6 +103,7 @@ function rowToFact(row: FactRow): StoredFact {
 /**
  * Saves a new fact to the database.
  * Returns the generated fact ID.
+ * Fase 3: Queues fact for embedding if embeddings enabled.
  */
 export function saveFact(newFact: NewFact): string {
   const db = getDatabase();
@@ -120,6 +123,18 @@ export function saveFact(newFact: NewFact): string {
     newFact.source ?? 'explicit',
     newFact.supersedes ?? null
   );
+
+  // Fase 3: Queue for async embedding (best-effort, non-blocking)
+  if (isEmbeddingsEnabled()) {
+    try {
+      queueFactForEmbedding(id);
+    } catch (error) {
+      logger.warn('Failed to queue fact for embedding', {
+        id,
+        error: error instanceof Error ? error.message : 'Unknown',
+      });
+    }
+  }
 
   logger.info('Saved new fact', { id, domain: newFact.domain });
   return id;

@@ -106,6 +106,43 @@ const SCHEMA = `
     UNIQUE(slot)
   );
   CREATE INDEX IF NOT EXISTS idx_summaries_slot ON summaries(slot);
+
+  -- Fase 3: Fact embeddings with vector data
+  CREATE TABLE IF NOT EXISTS fact_embeddings (
+    fact_id TEXT PRIMARY KEY,
+    embedding BLOB NOT NULL,
+    model_version TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (fact_id) REFERENCES facts(id) ON DELETE CASCADE
+  );
+
+  -- Fase 3: Pending embedding queue for async processing
+  CREATE TABLE IF NOT EXISTS pending_embedding (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fact_id TEXT NOT NULL UNIQUE,
+    attempts INTEGER DEFAULT 0,
+    last_attempt_at TEXT,
+    status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
+    error TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_pending_embedding_status ON pending_embedding(status);
+
+  -- Fase 3: Response cache with version tracking
+  CREATE TABLE IF NOT EXISTS response_cache (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    query_hash TEXT NOT NULL,
+    query_embedding BLOB NOT NULL,
+    fact_ids_hash TEXT NOT NULL,
+    system_version TEXT NOT NULL,
+    response TEXT NOT NULL,
+    ttl_seconds INTEGER NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_response_cache_lookup
+    ON response_cache(fact_ids_hash, system_version);
+  CREATE INDEX IF NOT EXISTS idx_response_cache_created
+    ON response_cache(created_at);
 `;
 
 /**
@@ -1119,4 +1156,304 @@ export function markFactAsStale(id: string): void {
   `);
   stmt.run(id);
   logger.info('Marked fact as stale due to decay', { id });
+}
+
+// ============= Fase 3: Pending Embedding Functions =============
+
+export type EmbeddingStatus = 'pending' | 'processing' | 'completed' | 'failed';
+
+export interface PendingEmbeddingRow {
+  id: number;
+  fact_id: string;
+  attempts: number;
+  last_attempt_at: string | null;
+  status: EmbeddingStatus;
+  error: string | null;
+  created_at: string;
+}
+
+/**
+ * Queues a fact for embedding.
+ * Uses INSERT OR IGNORE to handle duplicates gracefully.
+ */
+export function queueFactForEmbedding(factId: string): void {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    INSERT OR IGNORE INTO pending_embedding (fact_id)
+    VALUES (?)
+  `);
+  const result = stmt.run(factId);
+  if (result.changes > 0) {
+    logger.debug('Queued fact for embedding', { factId });
+  }
+}
+
+/**
+ * Gets pending embeddings for processing.
+ */
+export function getPendingEmbeddings(limit: number = 10): PendingEmbeddingRow[] {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    SELECT * FROM pending_embedding
+    WHERE status = 'pending'
+    ORDER BY created_at ASC
+    LIMIT ?
+  `);
+  return stmt.all(limit) as PendingEmbeddingRow[];
+}
+
+/**
+ * Gets count of pending embeddings.
+ */
+export function getPendingEmbeddingCount(): number {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    SELECT COUNT(*) as count FROM pending_embedding
+    WHERE status = 'pending'
+  `);
+  const result = stmt.get() as { count: number };
+  return result.count;
+}
+
+/**
+ * Marks an embedding as in-progress.
+ */
+export function markEmbeddingProcessing(id: number): void {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    UPDATE pending_embedding
+    SET status = 'processing', last_attempt_at = datetime('now')
+    WHERE id = ?
+  `);
+  stmt.run(id);
+}
+
+/**
+ * Marks an embedding as completed and removes from queue.
+ */
+export function markEmbeddingCompleted(id: number): void {
+  const database = getDatabase();
+  const stmt = database.prepare(`DELETE FROM pending_embedding WHERE id = ?`);
+  stmt.run(id);
+  logger.debug('Embedding completed', { id });
+}
+
+/**
+ * Marks an embedding as failed and increments attempt count.
+ */
+export function markEmbeddingFailed(id: number, error: string): void {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    UPDATE pending_embedding
+    SET status = CASE WHEN attempts >= 2 THEN 'failed' ELSE 'pending' END,
+        attempts = attempts + 1,
+        last_attempt_at = datetime('now'),
+        error = ?
+    WHERE id = ?
+  `);
+  stmt.run(error, id);
+  logger.debug('Embedding attempt failed', { id, error });
+}
+
+/**
+ * Recovers stalled embeddings (stuck in 'processing' status).
+ * Called at startup to reset items that were being processed when the app crashed.
+ */
+export function recoverStalledEmbeddings(): number {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    UPDATE pending_embedding
+    SET status = 'pending',
+        attempts = attempts + 1,
+        error = 'Recovered from stalled processing state'
+    WHERE status = 'processing'
+  `);
+  const result = stmt.run();
+  if (result.changes > 0) {
+    logger.warn('Recovered stalled embeddings', { count: result.changes });
+  }
+  return result.changes;
+}
+
+/**
+ * Cleans up old failed embedding records.
+ */
+export function cleanupFailedEmbeddings(retentionDays: number = 7): number {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    DELETE FROM pending_embedding
+    WHERE status = 'failed'
+      AND datetime(created_at, '+' || ? || ' days') < datetime('now')
+  `);
+  const result = stmt.run(retentionDays);
+  if (result.changes > 0) {
+    logger.debug('Cleaned up old failed embeddings', { count: result.changes });
+  }
+  return result.changes;
+}
+
+// ============= Fase 3: Fact Embeddings Storage =============
+
+export interface FactEmbeddingRow {
+  fact_id: string;
+  embedding: Buffer;
+  model_version: string;
+  created_at: string;
+}
+
+/**
+ * Saves a fact embedding to the database.
+ */
+export function saveFactEmbedding(
+  factId: string,
+  embedding: Buffer,
+  modelVersion: string
+): void {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    INSERT OR REPLACE INTO fact_embeddings (fact_id, embedding, model_version)
+    VALUES (?, ?, ?)
+  `);
+  stmt.run(factId, embedding, modelVersion);
+  logger.debug('Saved fact embedding', { factId, modelVersion });
+}
+
+/**
+ * Gets a fact embedding by fact ID.
+ */
+export function getFactEmbedding(factId: string): FactEmbeddingRow | null {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    SELECT * FROM fact_embeddings WHERE fact_id = ?
+  `);
+  return (stmt.get(factId) as FactEmbeddingRow) ?? null;
+}
+
+/**
+ * Gets all fact embeddings for a list of fact IDs.
+ */
+export function getFactEmbeddings(factIds: string[]): FactEmbeddingRow[] {
+  if (factIds.length === 0) return [];
+
+  const database = getDatabase();
+  const placeholders = factIds.map(() => '?').join(',');
+  const stmt = database.prepare(`
+    SELECT * FROM fact_embeddings WHERE fact_id IN (${placeholders})
+  `);
+  return stmt.all(...factIds) as FactEmbeddingRow[];
+}
+
+/**
+ * Gets facts that need embedding (no embedding or outdated model).
+ */
+export function getFactsNeedingEmbedding(modelVersion: string, limit: number = 100): FactRow[] {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    SELECT f.* FROM facts f
+    LEFT JOIN fact_embeddings e ON f.id = e.fact_id
+    LEFT JOIN pending_embedding p ON f.id = p.fact_id
+    WHERE f.stale = 0 AND f.archived = 0
+      AND (e.fact_id IS NULL OR e.model_version != ?)
+      AND (p.fact_id IS NULL OR p.status = 'failed')
+    LIMIT ?
+  `);
+  return stmt.all(modelVersion, limit) as FactRow[];
+}
+
+/**
+ * Deletes a fact embedding.
+ */
+export function deleteFactEmbedding(factId: string): boolean {
+  const database = getDatabase();
+  const stmt = database.prepare(`DELETE FROM fact_embeddings WHERE fact_id = ?`);
+  const result = stmt.run(factId);
+  return result.changes > 0;
+}
+
+// ============= Fase 3: Response Cache Functions =============
+
+export interface ResponseCacheRow {
+  id: number;
+  query_hash: string;
+  query_embedding: Buffer;
+  fact_ids_hash: string;
+  system_version: string;
+  response: string;
+  ttl_seconds: number;
+  created_at: string;
+}
+
+/**
+ * Saves a response to the cache.
+ */
+export function saveResponseCache(entry: {
+  queryHash: string;
+  queryEmbedding: Buffer;
+  factIdsHash: string;
+  systemVersion: string;
+  response: string;
+  ttlSeconds: number;
+}): void {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    INSERT INTO response_cache
+      (query_hash, query_embedding, fact_ids_hash, system_version, response, ttl_seconds)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  stmt.run(
+    entry.queryHash,
+    entry.queryEmbedding,
+    entry.factIdsHash,
+    entry.systemVersion,
+    entry.response,
+    entry.ttlSeconds
+  );
+  logger.debug('Saved response to cache', { queryHash: entry.queryHash });
+}
+
+/**
+ * Gets cache candidates with matching fact hash and system version.
+ * Returns entries that haven't expired yet.
+ */
+export function getResponseCacheCandidates(
+  factIdsHash: string,
+  systemVersion: string
+): ResponseCacheRow[] {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    SELECT * FROM response_cache
+    WHERE fact_ids_hash = ?
+      AND system_version = ?
+      AND datetime(created_at, '+' || ttl_seconds || ' seconds') > datetime('now')
+  `);
+  return stmt.all(factIdsHash, systemVersion) as ResponseCacheRow[];
+}
+
+/**
+ * Cleans up expired cache entries.
+ */
+export function cleanupExpiredCache(): number {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    DELETE FROM response_cache
+    WHERE datetime(created_at, '+' || ttl_seconds || ' seconds') < datetime('now')
+  `);
+  const result = stmt.run();
+  if (result.changes > 0) {
+    logger.debug('Cleaned expired cache entries', { count: result.changes });
+  }
+  return result.changes;
+}
+
+/**
+ * Clears the entire response cache.
+ */
+export function clearResponseCache(): number {
+  const database = getDatabase();
+  const stmt = database.prepare(`DELETE FROM response_cache`);
+  const result = stmt.run();
+  if (result.changes > 0) {
+    logger.info('Cleared response cache', { count: result.changes });
+  }
+  return result.changes;
 }

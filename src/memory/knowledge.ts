@@ -36,6 +36,8 @@ import {
 import { ensureMigration } from './facts-migration.js';
 import { formatSummariesForPrompt } from './summarization-service.js';
 import { getDecayStatus } from './decay-service.js';
+import { retrieveRelevantFacts } from './vector-search.js';
+import { isEmbeddingsReady } from './embeddings-state.js';
 
 const log = createLogger('knowledge');
 
@@ -140,6 +142,7 @@ export async function loadLearnings(): Promise<ParseResult> {
 /**
  * Carga todo el knowledge (user + facts) como string para el prompt.
  * Uses SQLite-based facts storage (Fase 1 Memory Architecture).
+ * Fase 3: Uses hybrid search for better relevance.
  *
  * @param userQuery - Optional user query for keyword-based filtering
  */
@@ -150,7 +153,8 @@ export async function loadKnowledge(userQuery?: string): Promise<string> {
   const userProfile = await loadUserProfile();
 
   // Get facts from SQLite, optionally filtered by query
-  const factsFormatted = formatFactsForPrompt(userQuery);
+  // Fase 3: Now async to support hybrid search
+  const factsFormatted = await formatFactsForPrompt(userQuery);
 
   return `${userProfile}\n\n${factsFormatted}`;
 }
@@ -208,14 +212,15 @@ function filterByDecay(facts: StoredFact[], queryRelevance?: number): StoredFact
  * Formats SQLite-based facts for the prompt.
  * Always includes health facts, then adds relevant facts based on query.
  * Fase 2: Uses getDecayStatus for proper decay-based filtering.
+ * Fase 3: Uses hybrid search (vector + keyword) when embeddings available.
  *
  * @param userQuery - Optional query for keyword-based filtering
  * @param maxTokens - Token budget for facts section
  */
-export function formatFactsForPrompt(
+export async function formatFactsForPrompt(
   userQuery?: string,
   maxTokens: number = TOKEN_BUDGETS.MAX_LEARNINGS_TOKENS
-): string {
+): Promise<string> {
   // Always get health facts (filtered by decay)
   const allHealthFacts = getHealthFacts();
   const healthFacts = filterByDecay(allHealthFacts);
@@ -223,12 +228,28 @@ export function formatFactsForPrompt(
   // Get relevant facts based on query, or recent facts if no query
   let relevantFacts: StoredFact[];
   if (userQuery && userQuery.trim()) {
-    // filterFactsByKeywords already respects low priority, but we apply decay filtering too
-    const rawRelevant = filterFactsByKeywords(userQuery, 30); // Get more, then filter
-    // Filter out health facts (already have them) and apply decay
-    const nonHealth = rawRelevant.filter(f => f.domain !== 'health');
-    // For keyword matches, we assume high relevance (they matched the query)
-    relevantFacts = filterByDecay(nonHealth, 0.8);
+    // Fase 3: Use hybrid search when embeddings are ready
+    if (isEmbeddingsReady()) {
+      try {
+        const rawRelevant = await retrieveRelevantFacts(userQuery, 30);
+        // Filter out health facts (already have them) and apply decay
+        const nonHealth = rawRelevant.filter(f => f.domain !== 'health');
+        relevantFacts = filterByDecay(nonHealth, 0.8);
+      } catch (error) {
+        // Fallback to keyword search
+        log.warn('Hybrid search failed, using keyword fallback', {
+          error: error instanceof Error ? error.message : 'Unknown',
+        });
+        const rawRelevant = filterFactsByKeywords(userQuery, 30);
+        const nonHealth = rawRelevant.filter(f => f.domain !== 'health');
+        relevantFacts = filterByDecay(nonHealth, 0.8);
+      }
+    } else {
+      // Fase 2 fallback: keyword search only
+      const rawRelevant = filterFactsByKeywords(userQuery, 30);
+      const nonHealth = rawRelevant.filter(f => f.domain !== 'health');
+      relevantFacts = filterByDecay(nonHealth, 0.8);
+    }
   } else {
     // No query - get most recent non-health facts
     const rawFacts = getFacts({ limit: 30 }).filter(f => f.domain !== 'health');

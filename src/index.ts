@@ -4,6 +4,8 @@ import { closeDatabase } from './memory/store.js';
 import { createLogger } from './utils/logger.js';
 import { runDecayCheck } from './memory/decay-service.js';
 import { startExtractionWorker, stopExtractionWorker } from './memory/extraction-service.js';
+import { initializeEmbeddings, getEmbeddingsStatusMessage } from './memory/embeddings-state.js';
+import { startEmbeddingWorker, stopEmbeddingWorker } from './memory/embedding-worker.js';
 
 const logger = createLogger('main');
 
@@ -25,8 +27,23 @@ async function main(): Promise<void> {
   // Fase 2: Start background extraction worker
   await startExtractionWorker();
 
+  // Fase 3: Initialize embeddings capability (non-blocking)
+  // Model loads lazily on first query, so this is fast
+  try {
+    const embeddingsEnabled = await initializeEmbeddings();
+    logger.info(getEmbeddingsStatusMessage());
+
+    // Start background embedding worker
+    if (embeddingsEnabled) {
+      await startEmbeddingWorker();
+    }
+  } catch (error) {
+    logger.warn('Embeddings initialization failed', { error });
+  }
+
   process.on('SIGINT', () => {
     console.log('\n\nRecibida señal de interrupción, cerrando...');
+    stopEmbeddingWorker();
     stopExtractionWorker();
     closeDatabase();
     process.exit(0);
@@ -34,6 +51,7 @@ async function main(): Promise<void> {
 
   process.on('SIGTERM', () => {
     logger.info('Received SIGTERM, shutting down...');
+    stopEmbeddingWorker();
     stopExtractionWorker();
     closeDatabase();
     process.exit(0);
@@ -41,6 +59,7 @@ async function main(): Promise<void> {
 
   process.on('uncaughtException', (error) => {
     logger.error('Uncaught exception', error);
+    stopEmbeddingWorker();
     stopExtractionWorker();
     closeDatabase();
     process.exit(1);
