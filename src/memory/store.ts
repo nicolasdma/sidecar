@@ -419,27 +419,70 @@ export function countSpontaneousMessagesInLastHour(): number {
   return result.count;
 }
 
-export function countSpontaneousMessagesToday(timezone: string): number {
-  const database = getDatabase();
-
-  // Get midnight in user's timezone
+/**
+ * Gets midnight in the specified timezone as a UTC ISO string.
+ * Handles timezone offsets correctly, including those with non-hour offsets (e.g., GMT+5:30).
+ */
+function getMidnightInTimezoneAsUTC(timezone: string): string {
   const now = new Date();
-  const formatter = new Intl.DateTimeFormat('en-CA', {
+
+  // Get today's date in the target timezone (YYYY-MM-DD format)
+  const dateFormatter = new Intl.DateTimeFormat('en-CA', {
     timeZone: timezone,
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
   });
-  const todayStr = formatter.format(now); // YYYY-MM-DD in user's timezone
+  const todayStr = dateFormatter.format(now);
 
-  // Convert to ISO for comparison (midnight local → UTC)
-  const midnightLocal = new Date(`${todayStr}T00:00:00`);
+  // Get timezone offset string (e.g., "GMT-3", "GMT+5:30")
+  const offsetFormatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    timeZoneName: 'shortOffset',
+  });
+  const parts = offsetFormatter.formatToParts(now);
+  const offsetPart = parts.find((p) => p.type === 'timeZoneName');
+
+  if (!offsetPart) {
+    // Fallback: parse in UTC (conservative - may over-count)
+    logger.warn('Could not determine timezone offset, using UTC', { timezone });
+    return new Date(`${todayStr}T00:00:00Z`).toISOString();
+  }
+
+  // Parse offset from "GMT-3" or "GMT+5:30" format
+  const offsetValue = offsetPart.value;
+  const match = offsetValue.match(/GMT([+-])(\d{1,2})(?::(\d{2}))?/);
+
+  if (!match) {
+    // Fallback for unexpected format
+    logger.warn('Unexpected timezone offset format, using UTC', {
+      timezone,
+      offsetValue,
+    });
+    return new Date(`${todayStr}T00:00:00Z`).toISOString();
+  }
+
+  const sign = match[1];
+  const hours = match[2]?.padStart(2, '0') ?? '00';
+  const minutes = match[3] ?? '00';
+  const isoOffset = `${sign}${hours}:${minutes}`;
+
+  // Create midnight in the target timezone and convert to UTC
+  const midnightWithOffset = new Date(`${todayStr}T00:00:00${isoOffset}`);
+  return midnightWithOffset.toISOString();
+}
+
+export function countSpontaneousMessagesToday(timezone: string): number {
+  const database = getDatabase();
+
+  // Get midnight in user's timezone, correctly converted to UTC
+  const midnightUTC = getMidnightInTimezoneAsUTC(timezone);
 
   const stmt = database.prepare(`
     SELECT COUNT(*) as count FROM spontaneous_messages
     WHERE sent_at >= ?
   `);
-  const result = stmt.get(midnightLocal.toISOString()) as { count: number };
+  const result = stmt.get(midnightUTC) as { count: number };
   return result.count;
 }
 

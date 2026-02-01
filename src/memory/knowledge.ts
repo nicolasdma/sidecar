@@ -6,7 +6,7 @@
  * - learnings.md: Facts aprendidos por el agente
  */
 
-import { readFile, writeFile, rename, mkdir } from 'fs/promises';
+import { readFile, writeFile, rename, mkdir, unlink } from 'fs/promises';
 import { existsSync } from 'fs';
 import { createLogger } from '../utils/logger.js';
 import { config } from '../utils/config.js';
@@ -65,9 +65,42 @@ export async function loadUserProfile(): Promise<string> {
 /**
  * Carga y parsea learnings.md.
  * Retorna facts parseados + warnings.
+ *
+ * Includes crash recovery: if an orphaned .tmp file exists from an
+ * interrupted atomic write, it will be recovered before reading.
  */
 export async function loadLearnings(): Promise<ParseResult> {
   try {
+    const tempPath = LEARNINGS_MD_PATH + '.tmp';
+
+    // Crash recovery: check for orphaned .tmp file
+    if (existsSync(tempPath)) {
+      log.warn('Found orphaned .tmp file from interrupted write, attempting recovery');
+      try {
+        const tempContent = await readFile(tempPath, 'utf-8');
+        const tempResult = parseLearningsFile(tempContent);
+
+        // Validate .tmp has meaningful content before recovering
+        if (tempResult.facts.length > 0 || tempContent.includes('# Learnings')) {
+          log.info('Recovering from .tmp file', { facts: tempResult.facts.length });
+          // Complete the interrupted atomic rename
+          await rename(tempPath, LEARNINGS_MD_PATH);
+        } else {
+          // Empty or corrupted .tmp, delete it
+          log.warn('Orphaned .tmp file is empty or invalid, deleting');
+          await unlink(tempPath);
+        }
+      } catch (recoveryError) {
+        log.error('Failed to recover from .tmp file', { error: recoveryError });
+        // Attempt to remove corrupt .tmp to prevent blocking future operations
+        try {
+          await unlink(tempPath);
+        } catch {
+          // Ignore unlink errors - file may have been removed by another process
+        }
+      }
+    }
+
     if (!existsSync(LEARNINGS_MD_PATH)) {
       log.warn('learnings.md no encontrado');
       return { facts: [], unparsed: [], warnings: [] };
