@@ -30,6 +30,7 @@ import {
   getFactsStats,
   getTotalFactsCount,
 } from '../memory/facts-store.js';
+import { getLocalRouter } from '../agent/local-router/index.js';
 
 /**
  * Parse duration string like "1h", "30m", "2h".
@@ -107,6 +108,9 @@ export class DefaultCommandHandler implements CommandHandler {
       case 'facts':
         return this.handleFacts(args);
 
+      case 'router-stats':
+        return this.handleRouterStats();
+
       default:
         return null; // Not handled - pass to LLM
     }
@@ -135,6 +139,7 @@ Comandos disponibles:
   /facts [domain]  - Listar facts guardados
                      Dominios: health, preferences, work, relationships,
                      schedule, goals, general, all
+  /router-stats    - Ver estadísticas del LocalRouter
   /exit            - Salir del programa
   /help            - Mostrar esta ayuda
 `;
@@ -388,6 +393,73 @@ O usá /facts sin argumentos para ver el resumen.`;
       const staleMarker = fact.stale ? ' [stale]' : '';
       output += `  - ${fact.fact}${staleMarker}\n    (${fact.confidence}, ${date})\n`;
     }
+
+    return output;
+  }
+
+  private handleRouterStats(): string {
+    const router = getLocalRouter();
+    const stats = router.getStats();
+    const config = router.getConfig();
+
+    const localPct =
+      stats.totalRequests > 0
+        ? ((stats.routedLocal / stats.totalRequests) * 100).toFixed(1)
+        : '0.0';
+    const llmPct =
+      stats.totalRequests > 0
+        ? ((stats.routedToLlm / stats.totalRequests) * 100).toFixed(1)
+        : '0.0';
+    const successRate =
+      stats.directSuccess + stats.directFailures > 0
+        ? (
+            (stats.directSuccess / (stats.directSuccess + stats.directFailures)) *
+            100
+          ).toFixed(1)
+        : '0.0';
+
+    let output = `
+┌─────────────────────────────────────┐
+│ LocalRouter Statistics              │
+├─────────────────────────────────────┤
+│ Enabled:         ${(config.enabled ? 'Yes' : 'No').padEnd(18)}│
+│ Total requests:  ${String(stats.totalRequests).padEnd(18)}│
+│ Routed local:    ${`${stats.routedLocal} (${localPct}%)`.padEnd(18)}│
+│ Routed to LLM:   ${`${stats.routedToLlm} (${llmPct}%)`.padEnd(18)}│
+├─────────────────────────────────────┤
+│ Direct success:  ${String(stats.directSuccess).padEnd(18)}│
+│ Direct failures: ${String(stats.directFailures).padEnd(18)}│
+│ Success rate:    ${`${successRate}%`.padEnd(18)}│
+│ Fallbacks:       ${String(stats.fallbacksToBrain).padEnd(18)}│
+│ Avg latency:     ${`${stats.avgLocalLatencyMs.toFixed(0)}ms`.padEnd(18)}│`;
+
+    // Add backoff info if available
+    if (stats.backoff) {
+      output += `
+├─────────────────────────────────────┤
+│ Backoff State                       │
+│ In backoff:      ${(stats.backoff.inBackoff ? 'Yes' : 'No').padEnd(18)}│
+│ Failures:        ${String(stats.backoff.consecutiveFailures).padEnd(18)}│`;
+
+      if (stats.backoff.backoffUntil) {
+        const until = stats.backoff.backoffUntil.toLocaleTimeString('es-AR', {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        });
+        output += `
+│ Until:           ${until.padEnd(18)}│`;
+      }
+
+      if (stats.backoff.lastError) {
+        const truncatedError = stats.backoff.lastError.slice(0, 15);
+        output += `
+│ Last error:      ${truncatedError.padEnd(18)}│`;
+      }
+    }
+
+    output += `
+└─────────────────────────────────────┘`;
 
     return output;
   }

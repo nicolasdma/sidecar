@@ -12,10 +12,10 @@
 | **Fase 1** | ✅ Completada | Foundation - Schema SQLite, ventana 6 turnos, `/remember`, `/facts`, keyword filtering |
 | **Fase 2** | ✅ Completada | Extracción automática de facts, summarization, topic shift, confidence decay |
 | **Fase 3** | ✅ Completada | Embeddings locales, ventana adaptativa, ranking semántico, hardening y bugfixes |
-| **Fase 3.5** | ⚠️ Código Listo | LocalRouter - Qwen local para intents determinísticos (pendiente tests/bugfixes) |
+| **Fase 3.5** | ✅ Completada | LocalRouter - Qwen local para intents determinísticos, tests, backoff, `/router-stats` |
 | **Fase 4** | ⏳ Pendiente | Memory Agent local, comandos expandidos, métricas, archive |
 
-**Última actualización:** 2026-02-01 (Fase 3 hardening completado)
+**Última actualización:** 2026-02-01 (Fase 3.5 bugfixes completados)
 
 ### Notas sobre Fase 3 (Completada)
 
@@ -42,6 +42,29 @@
 **Documentación:**
 - `plan/fase-3-implementation.md` - Plan completo con código de referencia
 - `plan/fase-3-final-fixes.md` - Fixes aplicados para production-ready
+
+### Notas sobre Fase 3.5 (Completada)
+
+**LocalRouter - Pre-Brain Intent Routing:**
+- **Clasificador:** Qwen2.5:3b-instruct via Ollama (~700ms latency)
+- **Intents Directos:** time, weather, reminder, list_reminders, cancel_reminder
+- **Respuestas:** Templates con variantes para evitar respuestas robóticas
+
+**Bugfixes Aplicados (2026-02-01):**
+- ✅ 90 unit tests en `tests/local-router/` (classifier, validation-rules, direct-executor, response-templates)
+- ✅ Exponential backoff para Ollama failures (3 failures → 30s, doubles up to 5min)
+- ✅ `/router-stats` CLI command con estadísticas detalladas y estado de backoff
+- ✅ Fix orden de validation rules (fact_memory antes de incomplete reminder)
+- ✅ Fix `cancel_reminder` retornando `success: true` para params inválidos
+
+**Pendiente (opcional):**
+- Issue 1: Fallback context to Brain (documentado, no implementado)
+- Issue 4: Verify Ollama model validation against real API
+- Integration tests con Ollama real
+
+**Documentación:**
+- `plan/fase-3.5-local-router.md` - Plan completo de LocalRouter
+- `plan/fase-3.5-bugfixes.md` - Bugfixes aplicados
 
 ---
 

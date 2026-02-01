@@ -1,7 +1,7 @@
 # Plan: AI Agent Companion (Nuevo Proyecto)
 
-> Estado: ✅ FASE 3 COMPLETADA | ⚠️ FASE 3.5 CÓDIGO LISTO (pendiente tests/bugfixes) | ✅ MEMORY ARCHITECTURE FASE 3 COMPLETADA
-> Última actualización: 2026-02-01 (actualización 24 - Fase 3 hardening completado, documentación actualizada)
+> Estado: ✅ FASE 3 COMPLETADA | ✅ FASE 3.5 COMPLETADA | ✅ MEMORY ARCHITECTURE FASE 3.5 COMPLETADA
+> Última actualización: 2026-02-01 (actualización 25 - Fase 3.5 bugfixes completados: 90 tests, backoff, /router-stats)
 
 ---
 
@@ -13,7 +13,7 @@
 | Fase 1 | ✅ | Foundation: SQLite, ventana 6 turnos, `/remember`, `/facts` |
 | Fase 2 | ✅ | Extracción automática, summarization, topic shift, decay |
 | **Fase 3** | ✅ | **Embeddings + vector search + ventana adaptativa + hardening** |
-| Fase 3.5 | ⚠️ | LocalRouter código listo, pendiente tests/bugfixes |
+| **Fase 3.5** | ✅ | **LocalRouter + 90 tests + backoff + `/router-stats`** |
 | Fase 4 | ⏳ | Memory Agent local, métricas, archive |
 
 ### Fase 3 Semántica - Detalle Final
@@ -38,6 +38,30 @@
 - Razón: LocalRouter (3.5) maneja tools determinísticos; riesgo de stale responses
 
 **Documentación:** `plan/fase-3-implementation.md`, `plan/fase-3-final-fixes.md`
+
+### Fase 3.5 LocalRouter - Detalle Final
+
+**Implementado:**
+- Clasificador de intents con Qwen2.5:3b-instruct via Ollama (~700ms)
+- 5 intents directos: time, weather, reminder, list_reminders, cancel_reminder
+- Validation rules para edge cases (negaciones, mass actions, fact_memory)
+- Response templates con variantes para evitar respuestas robóticas
+- Integración con Brain (pre-routing antes del agentic loop)
+
+**Bugfixes aplicados (2026-02-01):**
+- 90 unit tests en `tests/local-router/` con mocking completo de Ollama
+- Exponential backoff para Ollama failures (3 failures → 30s, doubles up to 5min max)
+- `/router-stats` CLI command con estadísticas y estado de backoff
+- Fix: orden de validation rules (fact_memory antes de incomplete reminder)
+- Fix: `cancel_reminder` retornaba `success: true` para params inválidos
+
+**Tests:**
+```bash
+npm run test:local-router       # 90 tests, ~300ms
+npm run test:local-router:watch # Watch mode
+```
+
+**Documentación:** `plan/fase-3.5-local-router.md`, `plan/fase-3.5-bugfixes.md`
 
 ---
 
