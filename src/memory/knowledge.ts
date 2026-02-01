@@ -382,6 +382,12 @@ async function writeLearningsAtomic(facts: Fact[], unparsed: string[]): Promise<
   const content = generateLearningsContent(facts, unparsed);
   const tempPath = LEARNINGS_MD_PATH + '.tmp';
 
+  // Bug 1 fix: Ensure directory exists before writing
+  if (!existsSync(KNOWLEDGE_DIR)) {
+    await mkdir(KNOWLEDGE_DIR, { recursive: true });
+    log.info('Created data/knowledge/ directory');
+  }
+
   // Escribir a archivo temporal
   await writeFile(tempPath, content, 'utf-8');
 
