@@ -3,6 +3,21 @@
 > "El agente debe ser agresivo en olvidar y quirúrgico en recordar."
 > "La memoria perfecta es un anti-patrón."
 
+---
+
+## Estado de Implementación
+
+| Fase | Estado | Descripción |
+|------|--------|-------------|
+| **Fase 1** | ✅ Completada | Foundation - Schema SQLite, ventana 6 turnos, `/remember`, `/facts`, keyword filtering |
+| **Fase 2** | ⏳ Pendiente | Extracción automática de facts, summarization, topic shift, confidence decay |
+| **Fase 3** | ⏳ Pendiente | Embeddings locales, ventana adaptativa, ranking semántico, cache |
+| **Fase 4** | ⏳ Pendiente | Memory Agent local, comandos expandidos, métricas, archive |
+
+**Última actualización:** 2026-02-01
+
+---
+
 ## Principios Fundamentales
 
 - El prompt NO puede crecer linealmente con el tiempo: O(1), no O(n)
@@ -339,25 +354,25 @@ El LLM NO genera el disclaimer (no gastar tokens explicando ahorro)
 
 ### SÍ (Obligatorio)
 
-- [ ] Extraer facts ANTES de descartar turnos
-- [ ] Resumen en formato key-value estructurado
-- [ ] Cachear respuestas deterministas
-- [ ] Límite hard de 4000 tokens por request
-- [ ] Filtrar facts por dominio relevante
-- [ ] Confidence decay en facts antiguos
-- [ ] Validar formato antes de omitir instrucciones
-- [ ] Disclaimer de dedup generado por sistema
+- [ ] Extraer facts ANTES de descartar turnos *(Fase 2)*
+- [ ] Resumen en formato key-value estructurado *(Fase 2)*
+- [ ] Cachear respuestas deterministas *(Fase 3)*
+- [ ] Límite hard de 4000 tokens por request *(Fase 2)*
+- [x] Filtrar facts por dominio relevante *(Fase 1 - keyword matching)*
+- [ ] Confidence decay en facts antiguos *(schema listo, cron Fase 2)*
+- [ ] Validar formato antes de omitir instrucciones *(Fase 2)*
+- [ ] Disclaimer de dedup generado por sistema *(Fase 3)*
 
-### NO (Prohibido)
+### NO (Prohibido) — Fase 1 cumple estas restricciones:
 
-- [ ] Guardar turnos completos indefinidamente
-- [ ] Resumir en prosa narrativa
-- [ ] Llamar LLM para lookups cacheables
-- [ ] Crecer contexto linealmente
-- [ ] Inyectar todos los facts siempre
-- [ ] Mantener facts sin re-confirmación > 180 días
-- [ ] Omitir formato sin validación previa
-- [ ] Gastar tokens explicando que se ahorran tokens
+- [x] Guardar turnos completos indefinidamente → ventana deslizante de 6 turnos
+- [ ] Resumir en prosa narrativa *(N/A, aún sin summarization)*
+- [ ] Llamar LLM para lookups cacheables *(N/A, sin cache aún)*
+- [x] Crecer contexto linealmente → O(1) con ventana fija
+- [x] Inyectar todos los facts siempre → filtrado por keywords activo
+- [ ] Mantener facts sin re-confirmación > 180 días *(decay cron en Fase 2)*
+- [ ] Omitir formato sin validación previa *(N/A)*
+- [x] Gastar tokens explicando que se ahorran tokens → no hacemos esto
 
 ---
 
@@ -399,31 +414,31 @@ TOKENS USADOS: 490 (vs ~2000+ sin estrategia)
 > **ACTUALIZADO** después de revisión crítica (§10).
 > Ajustes: extracción de facts diferida, ventana aumentada, WAL obligatorio.
 
-### Fase 1: Foundation (MVP Seguro)
+### Fase 1: Foundation (MVP Seguro) ✅ COMPLETADA
 
 **Objetivo:** Sistema funcional sin riesgo de pérdida de datos.
 
-- [ ] Schema SQLite para facts con confidence decay
-  - [ ] Campo `supersedes: fact_id | null` para versionado
-  - [ ] Campo `scope: "global" | "project" | "session"`
-  - [ ] `PRAGMA journal_mode=WAL;` obligatorio
-- [ ] Ventana deslizante básica
-  - [ ] 6 turnos fijos (sin adaptación por similarity)
-  - [ ] **MAX_TOKENS_VENTANA = 2000** (no 1200)
-  - [ ] `semantic_continuity` opcional, default `null`
-- [ ] Facts: solo lectura + storage manual
-  - [ ] Comando `/remember "fact text"` para storage explícito
-  - [ ] Comando `/facts` para listar facts activos
-  - [ ] **NO extracción automática** (diferida a Fase 2)
-- [ ] Filtrado de facts por keyword matching simple
-  - [ ] Lowercase + tokenize query
-  - [ ] Match contra campo `fact` de cada row
-  - [ ] Top-5 por `last_confirmed_at DESC`
+- [x] Schema SQLite para facts con confidence decay
+  - [x] Campo `supersedes: fact_id | null` para versionado
+  - [x] Campo `scope: "global" | "project" | "session"`
+  - [x] `PRAGMA journal_mode=WAL;` obligatorio
+- [x] Ventana deslizante básica
+  - [x] 6 turnos fijos (sin adaptación por similarity)
+  - [x] **MAX_TOKENS_VENTANA = 2000** (no 1200)
+  - [x] `semantic_continuity` opcional, default `null`
+- [x] Facts: solo lectura + storage manual
+  - [x] Comando `/remember "fact text"` para storage explícito
+  - [x] Comando `/facts` para listar facts activos
+  - [x] **NO extracción automática** (diferida a Fase 2)
+- [x] Filtrado de facts por keyword matching simple
+  - [x] Lowercase + tokenize query (via `extractSignificantWords`)
+  - [x] Match contra campo `fact` de cada row
+  - [x] Top-N por `last_confirmed_at DESC` con scoring
 
 **Criterio de éxito:**
-- Zero pérdida de datos bajo crash
-- Usuario puede almacenar y ver sus facts
-- Conversaciones de 20+ turnos funcionan sin overflow
+- ✅ Zero pérdida de datos bajo crash (WAL mode + atomic writes)
+- ✅ Usuario puede almacenar y ver sus facts (`/remember`, `/facts`)
+- ✅ Conversaciones de 20+ turnos funcionan sin overflow (ventana de 6 turnos)
 
 ---
 
