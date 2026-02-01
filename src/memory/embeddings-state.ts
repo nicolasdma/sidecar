@@ -188,7 +188,7 @@ export async function initializeEmbeddings(): Promise<boolean> {
   const db = getDatabase();
 
   // Step 1: Load sqlite-vec extension
-  const loadResult = loadSqliteVec(db);
+  const loadResult = await loadSqliteVec(db);
   if (!loadResult.success) {
     state = {
       ...state,

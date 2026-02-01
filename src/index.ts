@@ -44,7 +44,7 @@ function logStartupStatus(embeddingsEnabled: boolean): void {
   if (!embeddingsEnabled && state.reason === 'extension_missing') {
     console.log('⚠️  SEMANTIC SEARCH DISABLED');
     console.log('   Vector search requires sqlite-vec extension.');
-    console.log('   Install with: brew install asg017/sqlite-vec/sqlite-vec');
+    console.log('   Install with: npm install sqlite-vec');
     console.log('   Falling back to keyword search (Fase 2).\n');
   } else if (!embeddingsEnabled && state.reason === 'disabled_by_config') {
     console.log('ℹ️  Semantic search disabled by configuration (EMBEDDINGS_ENABLED=false)\n');

@@ -2,7 +2,10 @@
  * Fase 3: SQLite-vec Extension Loader
  *
  * Handles loading the sqlite-vec extension for vector operations.
- * Tries system paths first, then falls back to bundled binaries.
+ * Load order:
+ *   1. npm package (sqlite-vec) - works out of the box
+ *   2. System paths (Homebrew, etc.)
+ *   3. Bundled binaries in vendor/
  */
 
 import { platform, arch } from 'os';
@@ -11,6 +14,10 @@ import { existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import type Database from 'better-sqlite3';
 import { createLogger } from '../utils/logger.js';
+
+// Dynamic import for optional sqlite-vec npm package
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let sqliteVec: { load: (db: any) => void } | null = null;
 
 const logger = createLogger('embeddings-loader');
 
@@ -47,9 +54,29 @@ const SYSTEM_PATHS: Record<string, string[]> = {
 
 export interface LoadExtensionResult {
   success: boolean;
-  source: 'system' | 'bundled' | 'none';
+  source: 'npm' | 'system' | 'bundled' | 'none';
   path?: string;
   error?: string;
+}
+
+/**
+ * Attempts to load sqlite-vec via the npm package.
+ * This is the preferred method as it works out of the box.
+ */
+async function tryLoadFromNpm(db: Database.Database): Promise<boolean> {
+  try {
+    if (!sqliteVec) {
+      sqliteVec = await import('sqlite-vec');
+    }
+    const vec = sqliteVec;
+    if (vec) {
+      vec.load(db);
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -92,13 +119,19 @@ function findBundledExtension(): string | null {
 
 /**
  * Attempts to load sqlite-vec extension into the database.
- * Tries system installation first, then bundled binaries.
+ * Tries in order: npm package, system installation, bundled binaries.
  *
  * @param db - better-sqlite3 database instance
  * @returns Result indicating success/failure and source
  */
-export function loadSqliteVec(db: Database.Database): LoadExtensionResult {
-  // Try system installation first (preferred for updates)
+export async function loadSqliteVec(db: Database.Database): Promise<LoadExtensionResult> {
+  // Try npm package first (works out of the box for new users)
+  if (await tryLoadFromNpm(db)) {
+    logger.info('sqlite-vec loaded from npm package');
+    return { success: true, source: 'npm' };
+  }
+
+  // Try system installation (Homebrew, etc.)
   const systemPath = findSystemExtension();
   if (systemPath) {
     try {
@@ -116,13 +149,13 @@ export function loadSqliteVec(db: Database.Database): LoadExtensionResult {
     }
   }
 
-  // Fall back to bundled binary
+  // Fall back to bundled binary in vendor/
   const bundledPath = findBundledExtension();
   if (!bundledPath) {
     return {
       success: false,
       source: 'none',
-      error: 'No compatible sqlite-vec binary found. Install via Homebrew: brew install asg017/sqlite-vec/sqlite-vec',
+      error: 'sqlite-vec not found. Run: npm install sqlite-vec',
     };
   }
 
