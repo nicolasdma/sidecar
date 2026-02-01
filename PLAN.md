@@ -1,7 +1,7 @@
 # Plan: AI Agent Companion (Nuevo Proyecto)
 
-> Estado: ✅ FASE 3 COMPLETADA | ✅ MEMORY ARCHITECTURE FASE 1 COMPLETADA
-> Última actualización: 2026-02-01 (actualización 20)
+> Estado: ✅ FASE 3 COMPLETADA | ✅ MEMORY ARCHITECTURE FASE 2 COMPLETADA
+> Última actualización: 2026-02-01 (actualización 21)
 
 ---
 
@@ -4594,6 +4594,61 @@ Análisis arquitectónico realizado ANTES de comenzar Fase 4 para asegurar que l
 ---
 
 ## Changelog
+
+### 2026-02-01 (actualización 21) - Memory Architecture FASE 2 COMPLETADA
+
+**Implementación completa de la arquitectura de memoria Fase 2: Automatic Fact Extraction, Summarization, and Decay.**
+
+Basado en `plan/fase-2-implementation.md`:
+
+**Archivos creados:**
+- `src/llm/ollama.ts` - Client para Qwen2.5:3b-instruct via Ollama
+  - `generateWithOllama()` - generación de texto con JSON cleaning
+  - `generateJsonWithOllama()` - generación + parsing de JSON
+  - `checkOllamaAvailability()` - verificación de disponibilidad
+- `src/memory/decay-service.ts` - Confidence decay service
+  - `runDecayCheck()` - revisa facts y aplica aging/priority/stale según días desde confirmación
+  - Thresholds: 60+ días → aging, 90+ días → low priority, 120+ días → stale
+  - `resetFactDecay()` - reset decay cuando fact es re-confirmado
+- `src/memory/topic-detector.ts` - Topic shift detection (heuristic)
+  - `detectTopicShift()` - detecta cambios de tema via frases explícitas o domain transitions
+  - Domains: work, personal, health, tech, general
+  - `shouldTriggerSummarization()` - determina si amerita summarization
+- `src/memory/extraction-service.ts` - Async fact extraction
+  - `queueForExtraction()` - encola mensajes para procesamiento background
+  - `startExtractionWorker()` / `stopExtractionWorker()` - worker cada 5s
+  - Backoff: 3 intentos con delays 0s, 5s, 30s
+  - Prompt en inglés para token efficiency
+- `src/memory/summarization-service.ts` - Structured summaries
+  - `summarizeMessages()` - genera summary estructurado via Ollama
+  - `formatSummariesForPrompt()` - formatea summaries para system prompt
+  - 4 slots max con FIFO eviction
+
+**Archivos modificados:**
+- `src/memory/store.ts` - Schema extensions:
+  - Tabla `pending_extraction` para queue de extracción
+  - Tabla `summaries` para summaries estructurados (4 slots)
+  - Columnas `aging`, `priority` en facts
+  - CRUD functions para extractions y summaries
+- `src/memory/facts-store.ts`:
+  - `StoredFact` ahora incluye `aging`, `priority`
+  - `filterFactsByKeywords()` respeta priority (low priority necesita mayor relevancia)
+- `src/memory/knowledge.ts`:
+  - `formatFactsForPrompt()` incluye summaries
+- `src/agent/brain.ts`:
+  - Post-message: queue for extraction (fire-and-forget)
+- `src/agent/context-guard.ts`:
+  - On truncation: trigger summarization (fire-and-forget)
+- `src/index.ts`:
+  - Startup: `runDecayCheck()`, `startExtractionWorker()`
+  - Shutdown: `stopExtractionWorker()`
+
+**Verificación:**
+- ✅ TypeScript compila sin errores
+- ✅ Build exitoso
+- ✅ Schema migrations idempotentes
+
+---
 
 ### 2026-02-01 (actualización 20) - Memory Architecture FASE 1 COMPLETADA
 

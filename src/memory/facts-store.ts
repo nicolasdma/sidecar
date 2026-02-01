@@ -13,6 +13,7 @@ import {
   type FactConfidence,
   type FactScope,
   type FactSource,
+  type FactPriority,
 } from './store.js';
 import { extractSignificantWords } from './stopwords.js';
 import { createLogger } from '../utils/logger.js';
@@ -49,6 +50,9 @@ export interface StoredFact {
   source: FactSource;
   stale: boolean;
   archived: boolean;
+  // Fase 2 decay fields
+  aging: boolean;
+  priority: FactPriority;
 }
 
 // ============= Domain Mapping =============
@@ -94,6 +98,9 @@ function rowToFact(row: FactRow): StoredFact {
     source: row.source,
     stale: row.stale === 1,
     archived: row.archived === 1,
+    // Fase 2 decay fields
+    aging: row.aging === 1,
+    priority: row.priority ?? 'normal',
   };
 }
 
@@ -263,14 +270,19 @@ export function getFactById(id: string): StoredFact | null {
 
 // ============= Keyword Filtering =============
 
+// Minimum relevance score for low-priority facts (Fase 2 decay)
+const LOW_PRIORITY_MIN_SCORE = 0.5;
+
 /**
  * Filters facts by keyword matching against a query.
  * Uses word overlap scoring to rank relevance.
+ * Fase 2: Respects priority - low priority facts need higher relevance.
  *
  * Algorithm:
  * 1. Extract significant words from query (remove stopwords)
  * 2. For each fact, count matching words
- * 3. Return facts with at least one match, sorted by match count
+ * 3. Filter low-priority facts unless highly relevant
+ * 4. Return facts with at least one match, sorted by match count
  */
 export function filterFactsByKeywords(
   query: string,
@@ -294,8 +306,11 @@ export function filterFactsByKeywords(
   const queryWords = extractSignificantWords(query);
 
   if (queryWords.size === 0) {
-    // No significant words - return most recent facts
-    return rows.slice(0, limit).map(rowToFact);
+    // No significant words - return most recent normal-priority facts
+    return rows
+      .filter(r => r.priority !== 'low')
+      .slice(0, limit)
+      .map(rowToFact);
   }
 
   // Score each fact by word overlap
@@ -314,6 +329,12 @@ export function filterFactsByKeywords(
     if (matchCount > 0) {
       // Normalize score by query word count for fair comparison
       const score = matchCount / queryWords.size;
+
+      // Fase 2: Low priority facts need high relevance to be included
+      if (row.priority === 'low' && score < LOW_PRIORITY_MIN_SCORE) {
+        continue;
+      }
+
       scored.push({ row, score });
     }
   }

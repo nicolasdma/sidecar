@@ -1,0 +1,356 @@
+/**
+ * Fact Extraction Service (Fase 2)
+ *
+ * Extracts facts from user messages using local Ollama model (Qwen2.5:3b).
+ * Runs asynchronously in the background to avoid impacting latency.
+ *
+ * Components:
+ * - queueForExtraction(): Add message to pending queue
+ * - startExtractionWorker(): Background worker that processes queue
+ * - extractFactsFromText(): LLM call for fact extraction
+ *
+ * Queue Processing:
+ * - Runs every 5 seconds if items pending
+ * - Max 3 attempts per message
+ * - Backoff: immediate, 5s, 30s
+ * - After 3 failures: status='failed'
+ */
+
+import {
+  queueMessageForExtraction,
+  getPendingExtractions,
+  markExtractionProcessing,
+  markExtractionCompleted,
+  markExtractionFailed,
+  getPendingExtractionCount,
+  cleanupOldExtractions,
+  type PendingExtractionRow,
+} from './store.js';
+import { saveFact, type NewFact } from './facts-store.js';
+import { generateJsonWithOllama, checkOllamaAvailability } from '../llm/ollama.js';
+import { createLogger } from '../utils/logger.js';
+import type { FactDomain, FactConfidence } from './store.js';
+
+const logger = createLogger('extraction');
+
+// Worker configuration
+const WORKER_INTERVAL_MS = 5_000; // 5 seconds
+const BATCH_SIZE = 5; // Process up to 5 items per tick
+const BACKOFF_DELAYS = [0, 5_000, 30_000]; // Retry delays in ms
+
+// Worker state
+let workerTimer: ReturnType<typeof setInterval> | null = null;
+let isProcessing = false;
+
+// Extraction prompt (English for token efficiency)
+const EXTRACTION_PROMPT = `Extract facts about the user from this message.
+Output ONLY valid JSON array, no explanations.
+
+Format:
+[{"fact": "text", "domain": "work|preferences|decisions|personal|projects|health|relationships|schedule|goals|general", "confidence": "high|medium|low"}]
+
+If no facts found, output: []
+
+Look for:
+- Identity: "I am...", "I work at..."
+- Preferences: "I like...", "I prefer..."
+- Decisions: "I decided...", "from now on..."
+- Personal info: family, health, routines
+- Work: job, projects, colleagues
+- Goals: plans, objectives, intentions
+
+Message:
+`;
+
+// Valid domains for validation
+const VALID_DOMAINS: FactDomain[] = [
+  'work', 'preferences', 'decisions', 'personal', 'projects',
+  'health', 'relationships', 'schedule', 'goals', 'general',
+];
+
+// Valid confidence levels
+const VALID_CONFIDENCE: FactConfidence[] = ['high', 'medium', 'low'];
+
+interface ExtractedFact {
+  fact: string;
+  domain: string;
+  confidence: string;
+}
+
+/**
+ * Validates and normalizes an extracted fact.
+ */
+function validateExtractedFact(raw: ExtractedFact): NewFact | null {
+  // Validate fact text
+  if (!raw.fact || typeof raw.fact !== 'string' || raw.fact.trim().length < 3) {
+    return null;
+  }
+
+  // Validate and normalize domain
+  const domain = raw.domain?.toLowerCase() as FactDomain;
+  if (!VALID_DOMAINS.includes(domain)) {
+    logger.warn('Invalid domain in extracted fact', { domain: raw.domain });
+    return null;
+  }
+
+  // Validate and normalize confidence
+  const confidence = raw.confidence?.toLowerCase() as FactConfidence;
+  const validConfidence = VALID_CONFIDENCE.includes(confidence) ? confidence : 'medium';
+
+  return {
+    domain,
+    fact: raw.fact.trim(),
+    confidence: validConfidence,
+    source: 'inferred',
+  };
+}
+
+/**
+ * Extracts facts from text using Ollama.
+ * Returns validated facts ready for storage.
+ */
+async function extractFactsFromText(text: string): Promise<NewFact[]> {
+  const prompt = EXTRACTION_PROMPT + text;
+
+  const rawFacts = await generateJsonWithOllama<ExtractedFact[]>(prompt);
+
+  if (!rawFacts || !Array.isArray(rawFacts)) {
+    logger.debug('No facts extracted or invalid response');
+    return [];
+  }
+
+  const validatedFacts: NewFact[] = [];
+  for (const raw of rawFacts) {
+    const validated = validateExtractedFact(raw);
+    if (validated) {
+      validatedFacts.push(validated);
+    }
+  }
+
+  logger.debug('Extracted facts', {
+    input: text.slice(0, 100),
+    extracted: validatedFacts.length,
+  });
+
+  return validatedFacts;
+}
+
+/**
+ * Processes a single extraction item.
+ * Returns true if successful, false if should retry.
+ */
+async function processExtractionItem(item: PendingExtractionRow): Promise<boolean> {
+  try {
+    markExtractionProcessing(item.id);
+
+    const facts = await extractFactsFromText(item.content);
+
+    if (facts.length > 0) {
+      for (const fact of facts) {
+        saveFact(fact);
+      }
+      logger.info('Facts extracted and saved', {
+        messageId: item.message_id,
+        count: facts.length,
+      });
+    }
+
+    markExtractionCompleted(item.id);
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    markExtractionFailed(item.id, message);
+    logger.warn('Extraction failed', {
+      id: item.id,
+      attempt: item.attempts + 1,
+      error: message,
+    });
+    return false;
+  }
+}
+
+/**
+ * Processes the extraction queue.
+ * Called by the worker timer.
+ */
+async function processExtractionQueue(): Promise<void> {
+  // Prevent concurrent processing
+  if (isProcessing) {
+    return;
+  }
+
+  isProcessing = true;
+
+  try {
+    const items = getPendingExtractions(BATCH_SIZE);
+
+    if (items.length === 0) {
+      return;
+    }
+
+    logger.debug('Processing extraction queue', { items: items.length });
+
+    for (const item of items) {
+      // Check if we should wait based on backoff
+      if (item.attempts > 0 && item.last_attempt_at) {
+        const lastAttempt = new Date(item.last_attempt_at).getTime();
+        const backoffDelay = BACKOFF_DELAYS[Math.min(item.attempts, BACKOFF_DELAYS.length - 1)] || 0;
+        const shouldWait = Date.now() - lastAttempt < backoffDelay;
+
+        if (shouldWait) {
+          continue;
+        }
+      }
+
+      await processExtractionItem(item);
+    }
+  } catch (error) {
+    logger.error('Queue processing error', { error });
+  } finally {
+    isProcessing = false;
+  }
+}
+
+/**
+ * Queues a message for fact extraction.
+ * Fire-and-forget: errors are logged but don't propagate.
+ *
+ * @param messageId - Database ID of the message
+ * @param content - Text content to extract facts from
+ * @param role - Message role (usually 'user')
+ */
+export async function queueForExtraction(
+  messageId: number,
+  content: string,
+  role: string
+): Promise<void> {
+  try {
+    // Skip very short messages
+    if (!content || content.trim().length < 10) {
+      return;
+    }
+
+    // Skip messages that are unlikely to contain facts
+    if (isUnlikelyToContainFacts(content)) {
+      return;
+    }
+
+    queueMessageForExtraction(messageId, content, role);
+    logger.debug('Queued for extraction', { messageId });
+  } catch (error) {
+    logger.warn('Failed to queue extraction', { messageId, error });
+  }
+}
+
+/**
+ * Heuristic check for messages unlikely to contain facts.
+ */
+function isUnlikelyToContainFacts(content: string): boolean {
+  const lower = content.toLowerCase().trim();
+
+  // Very short or single word
+  if (lower.split(/\s+/).length <= 2) {
+    return true;
+  }
+
+  // Pure questions without personal info
+  const questionPatterns = [
+    /^(qué|que|cómo|como|cuándo|cuando|dónde|donde|por qué|porque|quién|quien)\s/,
+    /^(what|how|when|where|why|who)\s/,
+    /\?$/,
+  ];
+
+  if (questionPatterns.some(p => p.test(lower)) && !containsPersonalIndicators(lower)) {
+    return true;
+  }
+
+  // Greetings and short responses
+  const skipPatterns = [
+    /^(hola|hey|buenas|chau|gracias|ok|dale|bien|genial|perfecto|sí|si|no|claro)$/,
+    /^(hello|hi|thanks|ok|great|perfect|yes|no|sure)$/,
+  ];
+
+  if (skipPatterns.some(p => p.test(lower))) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Checks if content has personal indicators worth extracting.
+ */
+function containsPersonalIndicators(content: string): boolean {
+  const indicators = [
+    /\b(yo|me|mi|mis|mío)\b/,
+    /\b(i am|i'm|my|mine|i have|i've|i like|i prefer|i work|i decided)\b/,
+    /\b(soy|tengo|trabajo|prefiero|decidí|vivo|estoy)\b/,
+  ];
+  return indicators.some(p => p.test(content));
+}
+
+/**
+ * Starts the background extraction worker.
+ * Safe to call multiple times - will only start one worker.
+ */
+export async function startExtractionWorker(): Promise<void> {
+  if (workerTimer) {
+    logger.debug('Extraction worker already running');
+    return;
+  }
+
+  // Check Ollama availability
+  const availability = await checkOllamaAvailability();
+  if (!availability.available) {
+    logger.warn('Ollama not available, extraction worker disabled', {
+      error: availability.error,
+    });
+    return;
+  }
+
+  logger.info('Starting extraction worker', { model: availability.model });
+
+  // Cleanup old extractions on startup
+  cleanupOldExtractions();
+
+  // Start the worker
+  workerTimer = setInterval(() => {
+    processExtractionQueue().catch(error => {
+      logger.error('Worker tick failed', { error });
+    });
+  }, WORKER_INTERVAL_MS);
+
+  // Also run immediately if there are pending items
+  const pendingCount = getPendingExtractionCount();
+  if (pendingCount > 0) {
+    logger.info('Processing existing queue', { pending: pendingCount });
+    processExtractionQueue().catch(error => {
+      logger.error('Initial queue processing failed', { error });
+    });
+  }
+}
+
+/**
+ * Stops the extraction worker.
+ * Called during shutdown.
+ */
+export function stopExtractionWorker(): void {
+  if (workerTimer) {
+    clearInterval(workerTimer);
+    workerTimer = null;
+    logger.info('Extraction worker stopped');
+  }
+}
+
+/**
+ * Gets extraction service status.
+ */
+export function getExtractionStatus(): {
+  running: boolean;
+  pending: number;
+} {
+  return {
+    running: workerTimer !== null,
+    pending: getPendingExtractionCount(),
+  };
+}

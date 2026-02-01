@@ -75,7 +75,50 @@ const SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_facts_domain ON facts(domain);
   CREATE INDEX IF NOT EXISTS idx_facts_last_confirmed ON facts(last_confirmed_at DESC);
   CREATE INDEX IF NOT EXISTS idx_facts_stale ON facts(stale);
+
+  -- Fase 2: Pending extraction queue for async fact extraction
+  CREATE TABLE IF NOT EXISTS pending_extraction (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    role TEXT NOT NULL,
+    attempts INTEGER DEFAULT 0,
+    last_attempt_at TEXT,
+    status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
+    error TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(message_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_pending_extraction_status ON pending_extraction(status);
+
+  -- Fase 2: Structured summaries (4 slots max, FIFO eviction)
+  CREATE TABLE IF NOT EXISTS summaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    slot INTEGER NOT NULL CHECK (slot >= 1 AND slot <= 4),
+    topic TEXT NOT NULL,
+    discussed TEXT NOT NULL,
+    outcome TEXT,
+    decisions TEXT,
+    open_questions TEXT,
+    turn_start INTEGER NOT NULL,
+    turn_end INTEGER NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(slot)
+  );
+  CREATE INDEX IF NOT EXISTS idx_summaries_slot ON summaries(slot);
 `;
+
+/**
+ * Fase 2 schema migrations.
+ * These are ALTER TABLE statements that must be run separately
+ * since they can fail if columns already exist.
+ */
+const FASE2_MIGRATIONS = [
+  // Add aging column to facts (for decay service)
+  `ALTER TABLE facts ADD COLUMN aging INTEGER DEFAULT 0`,
+  // Add priority column to facts (for decay service)
+  `ALTER TABLE facts ADD COLUMN priority TEXT DEFAULT 'normal' CHECK (priority IN ('normal', 'low'))`,
+];
 
 interface MessageRow {
   id: number;
@@ -93,6 +136,8 @@ export type FactConfidence = 'high' | 'medium' | 'low';
 export type FactScope = 'global' | 'project' | 'session';
 export type FactSource = 'explicit' | 'inferred' | 'migrated';
 
+export type FactPriority = 'normal' | 'low';
+
 export interface FactRow {
   id: string;
   domain: FactDomain;
@@ -105,9 +150,65 @@ export interface FactRow {
   source: FactSource;
   stale: number;
   archived: number;
+  // Fase 2 decay columns
+  aging: number;
+  priority: FactPriority;
+}
+
+// ============= Fase 2: Pending Extraction Types =============
+
+export type ExtractionStatus = 'pending' | 'processing' | 'completed' | 'failed';
+
+export interface PendingExtractionRow {
+  id: number;
+  message_id: number;
+  content: string;
+  role: string;
+  attempts: number;
+  last_attempt_at: string | null;
+  status: ExtractionStatus;
+  error: string | null;
+  created_at: string;
+}
+
+// ============= Fase 2: Summary Types =============
+
+export interface SummaryRow {
+  id: number;
+  slot: number;
+  topic: string;
+  discussed: string; // JSON array
+  outcome: string | null;
+  decisions: string | null; // JSON array
+  open_questions: string | null; // JSON array
+  turn_start: number;
+  turn_end: number;
+  created_at: string;
 }
 
 let db: Database.Database | null = null;
+
+/**
+ * Runs Fase 2 migrations idempotently.
+ * Each migration can fail if already applied (column exists).
+ */
+function runFase2Migrations(database: Database.Database): void {
+  for (const migration of FASE2_MIGRATIONS) {
+    try {
+      database.exec(migration);
+      logger.debug('Migration applied', { sql: migration.slice(0, 50) });
+    } catch (error) {
+      // Ignore "duplicate column" errors - migration already applied
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes('duplicate column')) {
+        logger.debug('Migration already applied (column exists)', { sql: migration.slice(0, 50) });
+      } else {
+        // Log but don't fail for other errors (be defensive)
+        logger.warn('Migration failed (continuing)', { sql: migration.slice(0, 50), error: message });
+      }
+    }
+  }
+}
 
 /**
  * Issue #10: Simple health check to verify SQLite connection is functional.
@@ -151,6 +252,9 @@ export function getDatabase(): Database.Database {
 
   // Enable WAL mode for crash safety (per memory-architecture.md §9)
   db.exec('PRAGMA journal_mode=WAL;');
+
+  // Fase 2: Run migrations for new columns
+  runFase2Migrations(db);
 
   logger.info(`Database initialized: ${dbPath}`);
   return db;
@@ -540,4 +644,265 @@ export function getLastSpontaneousMessageTime(): Date | null {
   `);
   const result = stmt.get() as { sent_at: string } | undefined;
   return result ? new Date(result.sent_at) : null;
+}
+
+// ============= Fase 2: Pending Extraction Functions =============
+
+/**
+ * Adds a message to the extraction queue.
+ * Uses INSERT OR IGNORE to handle duplicate message_ids gracefully.
+ */
+export function queueMessageForExtraction(
+  messageId: number,
+  content: string,
+  role: string
+): void {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    INSERT OR IGNORE INTO pending_extraction (message_id, content, role)
+    VALUES (?, ?, ?)
+  `);
+  const result = stmt.run(messageId, content, role);
+  if (result.changes > 0) {
+    logger.debug('Queued message for extraction', { messageId });
+  }
+}
+
+/**
+ * Gets pending messages for extraction, ordered by creation time.
+ */
+export function getPendingExtractions(limit: number = 10): PendingExtractionRow[] {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    SELECT * FROM pending_extraction
+    WHERE status = 'pending'
+    ORDER BY created_at ASC
+    LIMIT ?
+  `);
+  return stmt.all(limit) as PendingExtractionRow[];
+}
+
+/**
+ * Marks an extraction as in-progress.
+ */
+export function markExtractionProcessing(id: number): void {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    UPDATE pending_extraction
+    SET status = 'processing', last_attempt_at = datetime('now')
+    WHERE id = ?
+  `);
+  stmt.run(id);
+}
+
+/**
+ * Marks an extraction as completed.
+ */
+export function markExtractionCompleted(id: number): void {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    UPDATE pending_extraction
+    SET status = 'completed'
+    WHERE id = ?
+  `);
+  stmt.run(id);
+  logger.debug('Extraction completed', { id });
+}
+
+/**
+ * Marks an extraction as failed and increments attempt count.
+ */
+export function markExtractionFailed(id: number, error: string): void {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    UPDATE pending_extraction
+    SET status = CASE WHEN attempts >= 2 THEN 'failed' ELSE 'pending' END,
+        attempts = attempts + 1,
+        last_attempt_at = datetime('now'),
+        error = ?
+    WHERE id = ?
+  `);
+  stmt.run(error, id);
+  logger.debug('Extraction attempt failed', { id, error });
+}
+
+/**
+ * Gets count of pending extractions.
+ */
+export function getPendingExtractionCount(): number {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    SELECT COUNT(*) as count FROM pending_extraction
+    WHERE status = 'pending'
+  `);
+  const result = stmt.get() as { count: number };
+  return result.count;
+}
+
+/**
+ * Cleans up old completed/failed extractions (older than 7 days).
+ */
+export function cleanupOldExtractions(): number {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    DELETE FROM pending_extraction
+    WHERE status IN ('completed', 'failed')
+      AND created_at < datetime('now', '-7 days')
+  `);
+  const result = stmt.run();
+  if (result.changes > 0) {
+    logger.info('Cleaned up old extractions', { count: result.changes });
+  }
+  return result.changes;
+}
+
+// ============= Fase 2: Summary Functions =============
+
+export interface SummaryData {
+  topic: string;
+  discussed: string[];
+  outcome?: string;
+  decisions?: string[];
+  openQuestions?: string[];
+  turnStart: number;
+  turnEnd: number;
+}
+
+/**
+ * Gets the next available slot (1-4), evicting oldest if full.
+ * Returns the slot number and whether eviction occurred.
+ */
+function getNextSummarySlot(database: Database.Database): { slot: number; evicted: boolean } {
+  // Find first empty slot
+  const emptySlot = database.prepare(`
+    SELECT s.slot FROM (SELECT 1 as slot UNION SELECT 2 UNION SELECT 3 UNION SELECT 4) s
+    LEFT JOIN summaries ON s.slot = summaries.slot
+    WHERE summaries.id IS NULL
+    ORDER BY s.slot
+    LIMIT 1
+  `).get() as { slot: number } | undefined;
+
+  if (emptySlot) {
+    return { slot: emptySlot.slot, evicted: false };
+  }
+
+  // All slots full - evict slot 1 and shift others
+  database.exec(`
+    DELETE FROM summaries WHERE slot = 1;
+    UPDATE summaries SET slot = slot - 1 WHERE slot > 1;
+  `);
+
+  return { slot: 4, evicted: true };
+}
+
+/**
+ * Saves a new summary to the next available slot.
+ * Implements FIFO eviction when all 4 slots are full.
+ */
+export function saveSummary(data: SummaryData): number {
+  const database = getDatabase();
+
+  const { slot, evicted } = getNextSummarySlot(database);
+  if (evicted) {
+    logger.info('Evicted oldest summary for new one');
+  }
+
+  const stmt = database.prepare(`
+    INSERT OR REPLACE INTO summaries (slot, topic, discussed, outcome, decisions, open_questions, turn_start, turn_end)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  stmt.run(
+    slot,
+    data.topic,
+    JSON.stringify(data.discussed),
+    data.outcome ?? null,
+    data.decisions ? JSON.stringify(data.decisions) : null,
+    data.openQuestions ? JSON.stringify(data.openQuestions) : null,
+    data.turnStart,
+    data.turnEnd
+  );
+
+  logger.info('Saved summary', { slot, topic: data.topic });
+  return slot;
+}
+
+/**
+ * Gets all active summaries, ordered by slot.
+ */
+export function getActiveSummaries(): SummaryRow[] {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    SELECT * FROM summaries
+    ORDER BY slot ASC
+  `);
+  return stmt.all() as SummaryRow[];
+}
+
+/**
+ * Gets summary count.
+ */
+export function getSummaryCount(): number {
+  const database = getDatabase();
+  const stmt = database.prepare('SELECT COUNT(*) as count FROM summaries');
+  const result = stmt.get() as { count: number };
+  return result.count;
+}
+
+/**
+ * Clears all summaries (for testing or reset).
+ */
+export function clearSummaries(): void {
+  const database = getDatabase();
+  database.exec('DELETE FROM summaries');
+  logger.info('Cleared all summaries');
+}
+
+// ============= Fase 2: Fact Decay Functions =============
+
+/**
+ * Updates aging status for a fact.
+ */
+export function updateFactAging(id: string, aging: number): void {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    UPDATE facts SET aging = ? WHERE id = ?
+  `);
+  stmt.run(aging, id);
+}
+
+/**
+ * Updates priority for a fact.
+ */
+export function updateFactPriority(id: string, priority: FactPriority): void {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    UPDATE facts SET priority = ? WHERE id = ?
+  `);
+  stmt.run(priority, id);
+}
+
+/**
+ * Gets facts that need decay check (not stale, not archived).
+ */
+export function getFactsForDecayCheck(): FactRow[] {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    SELECT * FROM facts
+    WHERE stale = 0 AND archived = 0
+    ORDER BY last_confirmed_at ASC
+  `);
+  return stmt.all() as FactRow[];
+}
+
+/**
+ * Marks a fact as stale.
+ */
+export function markFactAsStale(id: string): void {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    UPDATE facts SET stale = 1 WHERE id = ?
+  `);
+  stmt.run(id);
+  logger.info('Marked fact as stale due to decay', { id });
 }

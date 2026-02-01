@@ -17,6 +17,7 @@ import {
   TOKEN_BUDGETS,
 } from '../utils/tokens.js';
 import { scanMessagesForFacts, type ScanResult } from '../memory/fact-patterns.js';
+import { summarizeMessages } from '../memory/summarization-service.js';
 
 const logger = createLogger('context');
 
@@ -162,6 +163,13 @@ export async function truncateMessages(
         // Update warning to include backup failure
         potentialFactsWarning = `⚠️ ALERTA: ${scanResult.matches.length} facts potenciales NO pudieron respaldarse (backup failed)`;
       }
+    }
+
+    // Fase 2: Trigger summarization for removed messages (fire-and-forget)
+    if (removedMessages.length >= 2) {
+      summarizeMessages(removedMessages).catch(err => {
+        logger.warn('Summarization failed', { error: err instanceof Error ? err.message : err });
+      });
     }
   }
 

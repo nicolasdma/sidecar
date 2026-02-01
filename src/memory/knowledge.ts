@@ -34,6 +34,7 @@ import {
   type StoredFact,
 } from './facts-store.js';
 import { ensureMigration } from './facts-migration.js';
+import { formatSummariesForPrompt } from './summarization-service.js';
 
 const log = createLogger('knowledge');
 
@@ -235,6 +236,12 @@ export function formatFactsForPrompt(
   if (truncatedCount > 0) {
     output += `\n(Hay ${truncatedCount} facts adicionales en archivo)`;
     log.info(`Truncated ${truncatedCount} facts from prompt`);
+  }
+
+  // Fase 2: Include conversation summaries
+  const summariesSection = formatSummariesForPrompt();
+  if (summariesSection) {
+    output += '\n\n' + summariesSection;
   }
 
   return output;

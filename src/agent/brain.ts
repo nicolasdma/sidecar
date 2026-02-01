@@ -12,6 +12,7 @@ import {
   type ToolExecutionContext,
 } from '../tools/index.js';
 import { saveMessage, loadHistory } from '../memory/store.js';
+import { queueForExtraction } from '../memory/extraction-service.js';
 import { createLogger } from '../utils/logger.js';
 
 const logger = createLogger('brain');
@@ -85,6 +86,7 @@ export class Brain {
     });
 
     // Issue #7: Only save user message if there's actual user input
+    let lastMessageId: number | null = null;
     if (options.userInput) {
       const shouldSave = options.saveUserMessage !== false;
       if (shouldSave) {
@@ -92,7 +94,12 @@ export class Brain {
           role: 'user',
           content: options.userInput,
         };
-        saveMessage(userMessage);
+        lastMessageId = saveMessage(userMessage);
+
+        // Fase 2: Queue for async fact extraction (fire-and-forget)
+        queueForExtraction(lastMessageId, options.userInput, 'user').catch(err => {
+          logger.warn('Failed to queue extraction', { error: err instanceof Error ? err.message : err });
+        });
       }
     }
 
