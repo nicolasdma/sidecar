@@ -1,7 +1,7 @@
 # Plan: AI Agent Companion (Nuevo Proyecto)
 
-> Estado: ✅ FASE 2 COMPLETADA | 📋 FASE 3 LISTA PARA IMPLEMENTAR | 📐 FASE 4 DISEÑO COMPLETO
-> Última actualización: 2026-01-31 (actualización 15)
+> Estado: ✅ FASE 3 COMPLETADA | 📋 FASE 4 LISTA PARA IMPLEMENTAR
+> Última actualización: 2026-01-31 (actualización 19)
 
 ---
 
@@ -1384,8 +1384,26 @@ Día 5: Observabilidad & Polish
 
 ---
 
-### FASE 3: Proactivity
-**Objetivo:** Agente que inicia conversaciones de forma inteligente y no invasiva
+### FASE 3: Proactividad + Channel Layer
+**Objetivo:** Agente que inicia conversaciones de forma inteligente, con arquitectura multi-canal lista para Fase 4.
+
+> **Filosofía de diseño:** El LLM decide el "qué" y "cuándo" dentro de límites estrictos. El código impone invariantes que NUNCA se violan. El LLM tiene libertad para personalizar mensajes y decidir si hablar, pero el código garantiza que no puede spammear, interrumpir en quiet hours, ni crear reminders malformados.
+
+---
+
+#### Principios de División LLM vs Código
+
+| Responsabilidad | LLM decide | Código impone |
+|-----------------|------------|---------------|
+| **Contenido del mensaje** | ✅ Personaliza, contextualiza | ❌ No valida semántica |
+| **Si hablar o no** | ✅ Dentro de ventanas permitidas | ✅ Veto si fuera de ventana/límite |
+| **Hora exacta de reminder** | ❌ Pasa string natural al parser | ✅ Parser determinístico |
+| **Rate limits** | ❌ Informado pero no decide | ✅ Hardcoded, rolling window |
+| **Quiet hours** | ❌ Informado | ✅ Check antes de LLM call |
+| **Greeting windows** | ❌ Solo puede saludar si window=true | ✅ Calcula isGreetingWindow |
+| **Confirmación de reminder** | ✅ Muestra hora parseada al usuario | ✅ Parser retorna hora formateada |
+
+**Regla de oro:** Si una invariante DEBE cumplirse, el código la impone. El LLM solo tiene poder sobre decisiones donde "ambas opciones son válidas".
 
 ---
 
@@ -1459,8 +1477,8 @@ interface ProactiveConfig {
   // Spontaneous loop
   tickIntervalMs: number;           // Default: 15 * 60 * 1000 (15 min)
   minCooldownBetweenSpontaneousMs: number;  // Default: 30 * 60 * 1000 (30 min)
-  maxSpontaneousPerHour: number;    // Default: 2
-  maxSpontaneousPerDay: number;     // Default: 8
+  maxSpontaneousPerHour: number;    // Default: 2 (A3: rolling window)
+  maxSpontaneousPerDay: number;     // Default: 8 (A3: rolling window)
 
   // Quiet hours (NO mensajes espontáneos, reminders SÍ se envían)
   quietHoursStart: number;          // Default: 22 (10pm)
@@ -1468,7 +1486,36 @@ interface ProactiveConfig {
 
   // Safety
   circuitBreakerThreshold: number;  // Default: 5 (si 5 ticks seguidos generan mensaje, pausar)
+  llmTimeoutMs: number;             // Default: 10000 (A8: 10s timeout para decisiones)
 }
+```
+
+**Rate Limits con Rolling Window (A3):**
+
+| Límite | Implementación | Ejemplo |
+|--------|----------------|---------|
+| 2/hora | Contar mensajes con `timestamp > now - 1h` | A las 14:30, cuenta mensajes desde 13:30 |
+| 8/día | Contar mensajes con `timestamp > midnight local` | Reset a medianoche en timezone del usuario |
+| 30min cooldown | `now - lastSpontaneousMessageAt > 30min` | Comparación simple de timestamps |
+
+**Por qué rolling window:** Fixed buckets causan edge cases (ej: 7 mensajes al final del día, 8 más al inicio del siguiente = 15 mensajes en 2 horas). Rolling window es más intuitivo y predecible.
+
+**Defaults Conservadores (A10):**
+
+```typescript
+const DEFAULT_CONFIG: ProactiveConfig = {
+  tickIntervalMs: 15 * 60 * 1000,
+  minCooldownBetweenSpontaneousMs: 30 * 60 * 1000,
+  maxSpontaneousPerHour: 2,
+  maxSpontaneousPerDay: 8,
+  quietHoursStart: 22,
+  quietHoursEnd: 8,
+  circuitBreakerThreshold: 5,
+  llmTimeoutMs: 10000,
+  proactivityLevel: 'low',      // A10: Conservador si falta config
+  timezone: 'UTC',              // A10: Con warning visible
+  language: 'es'
+};
 ```
 
 **Configuración en user.md:**
@@ -1477,14 +1524,24 @@ interface ProactiveConfig {
 ## Communication Preferences
 - Proactivity level: medium   # low | medium | high
 - Quiet hours: 22:00 - 08:00  # No spontaneous messages
-- Language: es                # Para saludos y mensajes proactivos
+- Timezone: America/Argentina/Buenos_Aires
+- Language: es
+
+## Known Limitations (A7)
+La detección de actividad es limitada: el agente solo sabe cuándo le escribís.
+No detecta si estás en videollamada, escribiendo en otra app, o ocupado.
+Usá /quiet si necesitás silencio.
 ```
 
-| Nivel | Comportamiento |
-|-------|----------------|
-| `low` | Solo reminders. Sin mensajes espontáneos. |
-| `medium` | Reminders + saludos mañana/tarde + check-ins ocasionales. Max 4/día. |
-| `high` | Reminders + saludos + sugerencias contextuales. Max 8/día. |
+**Niveles de Proactividad con Ejemplos Concretos (A18):**
+
+| Nivel | Comportamiento | Qué esperar |
+|-------|----------------|-------------|
+| `low` | Solo reminders que pediste | 0 mensajes espontáneos. Silencioso salvo que pidas algo. |
+| `medium` | Reminders + 1-2 saludos/día + check-ins | "Buen día!" entre 8-10am, "¿Todo bien?" si no hablamos en 4+ horas. Max 4/día. |
+| `high` | Todo lo anterior + sugerencias contextuales | Igual que medium + "Vi que mencionaste X, ¿te ayudo?" Max 8/día. |
+
+**Importante:** Estos son máximos, no garantías. El agente puede elegir no hablar si no tiene nada relevante que decir.
 
 ---
 
@@ -1505,6 +1562,9 @@ interface ProactiveState {
   // Circuit breaker
   consecutiveTicksWithMessage: number;
   circuitBreakerTrippedUntil: Date | null;
+
+  // Mutex starvation tracking (F6)
+  consecutiveMutexSkips: number;  // Reset a 0 cuando se adquiere mutex, ERROR si ≥6
 
   // Activity tracking
   lastUserMessageAt: Date | null;
@@ -1582,11 +1642,24 @@ interface SetReminderArgs {
 
 1. Parsear `datetime`:
    - Si es ISO 8601: usar directo
-   - Si es natural language: usar heurística simple + timezone del user.md
-   - Si es ambiguo: retornar error pidiendo clarificación
-2. Validar que `trigger_at` es en el futuro
-3. Insertar en SQLite con `triggered = 0`
-4. Retornar confirmación: "Te voy a recordar [message] el [fecha formateada]"
+   - Si es natural language: parser determinístico + timezone del user.md
+   - Si es ambiguo: retornar error pidiendo clarificación (A2)
+2. Validar que `trigger_at` es en el futuro (si no, error con sugerencia - A2)
+3. Insertar en SQLite con `triggered = 0`, almacenar en **UTC** (A5)
+4. **Retornar confirmación explícita con hora parseada y timezone (A4):**
+
+```typescript
+interface SetReminderResult {
+  success: boolean;
+  reminder_id?: string;
+  // CRÍTICO: La confirmación DEBE mostrar la hora parseada para que el usuario verifique
+  confirmation?: string;  // "Te recuerdo a las 15:00 (America/Argentina/Buenos_Aires)"
+  error?: string;
+  suggestion?: string;
+}
+```
+
+**Regla de confirmación (A4):** El LLM **DEBE** mostrar la confirmación al usuario antes de considerar la tarea completa. Si el usuario ve "Te recuerdo a las 15:00" y quería 09:00, puede corregir inmediatamente.
 
 **Parsing de fechas naturales — Especificación Completa:**
 
@@ -1616,10 +1689,16 @@ El parser de fechas es **código determinístico**, NO depende del LLM. El LLM e
 | "el próximo martes" | Sin hora | "Falta la hora: 'el martes a las 10'" |
 | "pasado mañana" | Ambiguo en algunos contextos | "Usá 'en 2 días a las X' o especificá la fecha" |
 
-**Reglas de desambiguación:**
-1. Si solo hay hora sin AM/PM: horas 1-11 asumen PM si son futuras, horas 12-23 son 24h
-2. Si "el lunes" y hoy es lunes: significa PRÓXIMO lunes, no hoy
-3. Si "mañana a las 9" y son las 23:00: funciona normal (mañana = día siguiente)
+**Reglas de desambiguación (A1, A2):**
+
+| Caso | Comportamiento | Ejemplo |
+|------|----------------|---------|
+| Hora sin AM/PM | 1-11 → PM si futura, 12-23 → 24h | "a las 3" → 15:00 |
+| "el lunes" cuando hoy es lunes (A1) | **PRÓXIMO lunes**, no hoy | Lunes 10am → lunes siguiente |
+| "hoy a las X" cuando X ya pasó (A2) | **ERROR** con sugerencia | 15:00 y dice "hoy a las 9" → "Esa hora ya pasó. ¿Querés decir mañana a las 9?" |
+| "mañana a las X" cerca de medianoche | Día siguiente, normal | 23:00 y dice "mañana a las 9" → mañana 09:00 |
+
+**Importante:** No adivinamos. Si hay ambigüedad, retornamos error con sugerencia.
 
 **Manejo de errores:**
 
@@ -1643,23 +1722,33 @@ interface DateParseResult {
 
 ---
 
-**Timezone — Especificación Completa:**
+**Timezone — Especificación Completa (A5, A9):**
 
 | Aspecto | Especificación |
 |---------|----------------|
 | **Formato** | IANA timezone (ej: `America/Argentina/Buenos_Aires`), NO offsets como "GMT-3" |
 | **Ubicación** | Campo `Timezone` en `data/knowledge/user.md` |
-| **Validación** | Al cargar user.md, validar que el timezone existe en la base de datos IANA |
-| **Si inválido** | Log error, usar UTC, advertir al usuario en próxima interacción |
-| **Si falta** | Usar UTC, agregar nota en respuesta: "Configurá tu timezone en user.md" |
+| **Almacenamiento (A5)** | **Siempre UTC** en SQLite. Convertir a local solo para display. |
+| **Validación** | Al startup, validar con `Intl.supportedValuesOf('timeZone')` |
+| **Si inválido (A9)** | **FALLAR LOUDLY** — NO iniciar, mostrar error claro. No fallback silencioso. |
+| **Si falta** | Usar UTC + log WARNING visible. Agregar nota en primera respuesta. |
 
-**Ejemplo en user.md:**
-```markdown
-## Communication Preferences
-- Timezone: America/Argentina/Buenos_Aires
+```typescript
+// Validación al startup (A9)
+function validateTimezone(tz: string): void {
+  const valid = Intl.supportedValuesOf('timeZone');
+  if (!valid.includes(tz)) {
+    throw new Error(`Timezone '${tz}' no válido. Configurá uno válido en user.md (ej: America/Argentina/Buenos_Aires)`);
+  }
+}
 ```
 
-**Por qué IANA y no offsets:**
+**Por qué FALLAR (no fallback):**
+- Fallback silencioso a UTC causa reminders 3h off → usuario furioso
+- Mejor no iniciar que operar mal silenciosamente
+- Error claro permite que el usuario lo arregle
+
+**Por qué IANA:**
 - Los offsets cambian con horario de verano
 - "GMT-3" es ambiguo (¿con o sin DST?)
 - IANA maneja DST automáticamente
@@ -1975,15 +2064,44 @@ async function spontaneousLoopTick(): Promise<void> {
   // CRÍTICO: Adquirir el lock para garantizar exclusión mutua con CLI
   const acquired = await brainMutex.tryAcquire();
   if (!acquired) {
-    logger.debug('spontaneous_skipped', { reason: 'brain_locked' });
+    // F6: Track mutex starvation
+    const newSkips = state.consecutiveMutexSkips + 1;
+    await updateProactiveState({ consecutiveMutexSkips: newSkips });
+
+    if (newSkips >= 6) {
+      logger.error('spontaneous_starved', { consecutive_skips: newSkips });
+    } else {
+      logger.debug('spontaneous_skipped', { reason: 'brain_locked', consecutive: newSkips });
+    }
     return;
   }
 
-  try {
-    // === DECISIÓN DEL LLM ===
+  // F6: Reset mutex skip counter on successful acquire
+  if (state.consecutiveMutexSkips > 0) {
+    await updateProactiveState({ consecutiveMutexSkips: 0 });
+  }
 
+  try {
+    // === DECISIÓN DEL LLM (con AbortController - F4) ===
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);  // 10s timeout
+
+    // Construir contexto ANTES del try interno (para logging)
     const context = await buildSpontaneousContext(state, config);
-    const decision = await askLLMForSpontaneousDecision(context);
+
+    let decision: SpontaneousDecision;
+    try {
+      decision = await askLLMForSpontaneousDecision(context, { signal: controller.signal });
+      clearTimeout(timeoutId);
+    } catch (error) {
+      clearTimeout(timeoutId);
+      if (error.name === 'AbortError') {
+        logger.warn('spontaneous_skipped', { reason: 'llm_timeout' });
+        return;
+      }
+      throw error;
+    }
 
     // Log SIEMPRE (incluso no-ops)
     logger.info('spontaneous_decision', {
@@ -2003,7 +2121,7 @@ async function spontaneousLoopTick(): Promise<void> {
       return;
     }
 
-    // === VALIDACIÓN POST-DECISIÓN ===
+    // === VALIDACIÓN POST-DECISIÓN (A6: code-enforced, no solo prompt) ===
 
     // P14: Validar messageType (defense contra respuestas malformadas del LLM)
     const validMessageTypes = ['greeting', 'checkin', 'contextual'];
@@ -2024,6 +2142,18 @@ async function spontaneousLoopTick(): Promise<void> {
       return;
     }
 
+    // A6: Code-enforce greeting repetido (no confiar solo en prompt)
+    if (decision.messageType === 'greeting') {
+      const today = getTodayDate();
+      if (state.lastGreetingDate === today) {
+        logger.info('spontaneous_blocked', {
+          reason: 'greeting_already_sent_today',
+          lastGreetingType: state.lastGreetingType
+        });
+        return;  // Ya hubo saludo hoy, código bloquea aunque LLM quiera otro
+      }
+    }
+
     // P15: Re-check freshness de lastUserMessageAt (el usuario pudo escribir durante LLM latency)
     const freshLastMessage = await getLastUserMessageAt();
     if (freshLastMessage) {
@@ -2034,9 +2164,9 @@ async function spontaneousLoopTick(): Promise<void> {
       }
     }
 
-    // === ENVIAR MENSAJE (patrón: mark before send) ===
+    // === ENVIAR MENSAJE (patrón: save-before-send con rollback - F5, ARCH-D5) ===
 
-    // 1. PRIMERO: Actualizar estado (marca intención, previene duplicados)
+    // 1. PRIMERO: Actualizar estado proactivo (marca intención, previene duplicados)
     const now = new Date();
     const newState = {
       lastSpontaneousMessageAt: now,
@@ -2048,16 +2178,29 @@ async function spontaneousLoopTick(): Promise<void> {
     };
     await updateProactiveState(newState);
 
-    // 2. DESPUÉS: Enviar (si falla, ya marcamos así que no duplicamos)
-    await notificationSink.send(decision.suggestedMessage, {
-      type: 'spontaneous',
-      messageType: decision.messageType
+    // 2. Guardar mensaje ANTES de enviar (con pending=true)
+    const messageId = await saveMessage('assistant', decision.suggestedMessage, {
+      proactive: true,
+      pending: true  // Marca como no confirmado aún
     });
 
-    // 3. Guardar en historial de conversación
-    await saveMessage('assistant', decision.suggestedMessage, { proactive: true });
+    // 3. Enviar (con rollback si falla)
+    try {
+      await notificationSink.send(decision.suggestedMessage, {
+        type: 'spontaneous',
+        messageType: decision.messageType
+      });
 
-    // 4. Circuit breaker check
+      // 4. Marcar mensaje como delivered
+      await markMessageDelivered(messageId);
+    } catch (sendError) {
+      // Rollback: eliminar mensaje no entregado
+      await deleteMessage(messageId);
+      logger.error('message_rollback', { id: messageId, reason: sendError.message });
+      throw sendError;
+    }
+
+    // 5. Circuit breaker check
     if (newState.consecutiveTicksWithMessage >= config.circuitBreakerThreshold) {
       logger.warn('circuit_breaker_tripped', { consecutive: newState.consecutiveTicksWithMessage });
       await updateProactiveState({
@@ -2076,6 +2219,12 @@ async function spontaneousLoopTick(): Promise<void> {
 2. **Validación de messageType (P14)**: Rechaza tipos inválidos antes de enviar.
 3. **Re-check freshness (P15)**: Después del LLM, antes de enviar, verificar que el usuario no escribió durante la latency.
 4. **Mark before send**: Actualizar estado ANTES de enviar, para evitar duplicados si hay crash entre ambos.
+
+**Cambios adicionales del review final (F4-F8):**
+5. **AbortController (F4)**: El timeout cancela realmente el request HTTP, no solo lo ignora.
+6. **Mutex starvation tracking (F6)**: Contador de skips consecutivos con ERROR si ≥6.
+7. **Save-before-send con rollback (F5, ARCH-D5)**: Guarda mensaje pending antes de enviar, rollback si falla.
+8. **Graceful degradation (F7, ARCH-D7)**: Usar `loadProactiveStateSafe()` que retorna null en error de DB.
 
 ---
 
@@ -2467,6 +2616,234 @@ Si isGreetingWindow = false, NO generes saludos aunque parezca apropiado.
 
 ---
 
+##### Bug F1: Timezone Inválido Silencioso (NUEVO)
+
+| Aspecto | Detalle |
+|---------|---------|
+| **Escenario** | user.md tiene `Timezone: America/Buenos_Aire` (typo). Sistema usa UTC silenciosamente. Reminders disparan 3 horas off. |
+| **Causa raíz** | Fallback silencioso a UTC cuando timezone no reconocido. |
+| **Síntoma** | Reminders consistentemente a hora incorrecta. Usuario no sabe por qué. |
+| **Modo de falla** | **SILENCIOSO** — sistema parece funcionar pero con datos incorrectos. |
+
+**Mitigación Fase 3:**
+- **Fallar loudly al startup:** Si timezone inválido, NO iniciar, mostrar error claro
+- **Validación:** Usar `Intl.supportedValuesOf('timeZone')` para validar
+- **Mensaje:** "Timezone 'X' no reconocido. Configurá un timezone válido en user.md (ej: America/Argentina/Buenos_Aires)"
+- **NO usar fallback silencioso:** Es preferible fallar que operar con datos incorrectos
+
+---
+
+##### Bug F2: user.md Corrupto o Faltante (NUEVO)
+
+| Aspecto | Detalle |
+|---------|---------|
+| **Escenario** | user.md no existe, o tiene YAML/markdown inválido. Sistema intenta cargar configuración. |
+| **Causa raíz** | No hay manejo de archivo faltante/corrupto en carga de configuración. |
+| **Síntoma** | Crash al startup, o comportamiento impredecible si valores undefined. |
+| **Modo de falla** | **RUIDOSO** — crash visible o errores obvios. |
+
+**Mitigación Fase 3:**
+- **Defaults conservadores explícitos:**
+  ```typescript
+  const DEFAULT_CONFIG = {
+    proactivityLevel: 'low',      // Solo reminders, sin espontáneos
+    quietHoursStart: 22,          // 10pm
+    quietHoursEnd: 8,             // 8am
+    timezone: 'UTC',              // Con warning visible
+    language: 'es'
+  };
+  ```
+- **Si archivo faltante:** Crear con defaults + log INFO "Creado user.md con configuración por defecto"
+- **Si archivo corrupto:** Log WARNING "user.md corrupto, usando defaults" + usar defaults
+- **NUNCA crash por archivo de configuración**
+
+---
+
+##### Bug F3: LLM Timeout Durante Proactive Tick (NUEVO)
+
+| Aspecto | Detalle |
+|---------|---------|
+| **Escenario** | LLM tarda 30+ segundos en responder durante tick espontáneo. Mutex held todo ese tiempo. CLI input bloqueado. |
+| **Causa raíz** | No hay timeout para LLM calls en proactive loop. |
+| **Síntoma** | CLI no responde, o proactive loop nunca ejecuta (starvation). |
+| **Modo de falla** | **INTERMITENTE** — depende de latencia de LLM. |
+
+**Mitigación Fase 3:**
+- **Timeout de 10 segundos** para decisiones espontáneas
+- **Implementación:**
+  ```typescript
+  const decision = await Promise.race([
+    askLLMForSpontaneousDecision(context),
+    timeout(10000).then(() => ({ shouldSpeak: false, reason: 'llm_timeout' }))
+  ]);
+  ```
+- **Si timeout:** Log WARNING, no enviar mensaje, liberar mutex, continuar
+- **No retry inmediato:** Siguiente tick en 15 minutos
+- **Logging:** `spontaneous_skipped: { reason: 'llm_timeout', elapsed_ms: X }`
+
+---
+
+##### Bug F4: LLM Timeout No Cancela Request (NUEVO - Review Fase 3)
+
+| Aspecto | Detalle |
+|---------|---------|
+| **Escenario** | Timeout de 10s se activa con `Promise.race()`. El request al LLM sigue ejecutándose en background. LLM responde 20s después. |
+| **Causa raíz** | `Promise.race()` no cancela el promise perdedor, solo ignora su resultado. |
+| **Síntoma** | Resource leak, posible respuesta huérfana que podría causar side effects si hay callbacks. |
+| **Modo de falla** | **SILENCIOSO** — funciona pero desperdicia recursos. |
+
+**Mitigación Fase 3:**
+- **Usar `AbortController`** para cancelar el request HTTP al LLM
+- **Implementación:**
+  ```typescript
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+  try {
+    const decision = await askLLMForSpontaneousDecision(context, { signal: controller.signal });
+    clearTimeout(timeoutId);
+    // ... procesar decisión
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      logger.warn('spontaneous_skipped', { reason: 'llm_timeout' });
+      return;
+    }
+    throw error;
+  }
+  ```
+- **Propagar signal** a fetch/axios call interno
+
+---
+
+##### Bug F5: Message Persistence Ordering (NUEVO - Review Fase 3)
+
+| Aspecto | Detalle |
+|---------|---------|
+| **Escenario** | `notificationSink.send()` tiene éxito. Luego `saveMessage()` falla (SQLite full, etc.). Usuario ve mensaje, pero no está en historial. |
+| **Causa raíz** | Orden actual: send → save. Si save falla, el contexto del próximo LLM call no tiene el mensaje. |
+| **Síntoma** | LLM no sabe qué dijo, puede repetir. Historial incompleto. |
+| **Modo de falla** | **SILENCIOSO** — contexto drift gradual. |
+
+**Mitigación Fase 3:**
+- **Opción A (elegida):** Save ANTES de send, rollback si send falla
+  ```typescript
+  const messageId = await saveMessage('assistant', message, { proactive: true, pending: true });
+  try {
+    await notificationSink.send(message);
+    await markMessageDelivered(messageId);
+  } catch (error) {
+    await deleteMessage(messageId);  // Rollback
+    throw error;
+  }
+  ```
+- **Opción B (descartada):** Transacción SQLite que abarca send — no es posible, send es I/O externo
+- **Logging:** `message_rollback: { id, reason: 'send_failed' }`
+
+---
+
+##### Bug F6: Mutex Starvation del Spontaneous Loop (NUEVO - Review Fase 3)
+
+| Aspecto | Detalle |
+|---------|---------|
+| **Escenario** | Usuario en conversación activa. CLI mantiene mutex durante 30s de streaming LLM. 3 ticks consecutivos de spontaneous loop hacen `tryAcquire()` y fallan. |
+| **Causa raíz** | `tryAcquire()` es non-blocking y no hay retry/backoff. |
+| **Síntoma** | Spontaneous loop efectivamente muerto durante conversaciones largas. No hay alerting. |
+| **Modo de falla** | **SILENCIOSO** — sistema parece funcionar pero proactividad nunca ocurre. |
+
+**Mitigación Fase 3:**
+- **Counter de skips consecutivos:** Track `consecutiveMutexSkips` en ProactiveState
+- **Logging si 3+ skips:** `spontaneous_starved: { consecutive_skips: N }`
+- **NO usar wait con timeout:** Queremos non-blocking, pero con visibilidad
+- **Reset counter:** Cuando un tick adquiere mutex exitosamente
+- **Threshold de alerta:** Si 6+ skips (1.5 horas), log ERROR
+
+**Implementación:**
+```typescript
+const acquired = await brainMutex.tryAcquire();
+if (!acquired) {
+  const newSkips = state.consecutiveMutexSkips + 1;
+  await updateProactiveState({ consecutiveMutexSkips: newSkips });
+
+  if (newSkips >= 6) {
+    logger.error('spontaneous_starved', { consecutive_skips: newSkips });
+  } else {
+    logger.debug('spontaneous_skipped', { reason: 'mutex_busy', consecutive: newSkips });
+  }
+  return;
+}
+
+// Mutex acquired, reset counter
+await updateProactiveState({ consecutiveMutexSkips: 0 });
+```
+
+---
+
+##### Bug F7: SQLite Corruption No Manejado (NUEVO - Review Fase 3)
+
+| Aspecto | Detalle |
+|---------|---------|
+| **Escenario** | `memory.db` se corrompe (power loss, disk full, etc.). Queries a `proactive_state` o `reminders` crashean. |
+| **Causa raíz** | No hay recovery path para corrupción de DB. |
+| **Síntoma** | Sistema inutilizable. Requires manual intervention. |
+| **Modo de falla** | **CATASTRÓFICO** — pérdida total de funcionalidad. |
+
+**Mitigación Fase 3 (degradación graciosa):**
+- **Wrap queries críticos** en try/catch con fallback
+- **Proactive loops:** Si DB falla, log ERROR y skip tick (no crash)
+- **Reminders:** Si query falla, log ERROR, continuar sin reminders
+- **Al startup:** Intentar `PRAGMA integrity_check`. Si falla, ofrecer recrear DB.
+
+**Implementación:**
+```typescript
+async function loadProactiveStateSafe(): Promise<ProactiveState | null> {
+  try {
+    return await loadProactiveState();
+  } catch (error) {
+    logger.error('proactive_state_db_error', { error: error.message });
+    return null;  // Caller debe manejar null = skip tick
+  }
+}
+```
+
+**Diferido para Fase 3:** Recreación automática de DB. Por ahora, solo degradación graciosa.
+
+---
+
+##### Bug F8: DST Edge Cases en Date Parsing (NUEVO - Review Fase 3)
+
+| Aspecto | Detalle |
+|---------|---------|
+| **Escenario** | Usuario dice "mañana a las 2am" durante transición DST "spring forward". La hora 2am no existe ese día. |
+| **Causa raíz** | Parser de fechas no considera transiciones DST. |
+| **Síntoma** | Reminder creado para hora inválida, comportamiento impredecible. |
+| **Modo de falla** | **RARO** — solo ocurre 2 veces al año, pero confuso cuando pasa. |
+
+**Mitigación Fase 3:**
+- **Detectar horas inválidas** durante DST con luxon o date-fns-tz
+- **Si hora no existe:** ERROR con sugerencia "Esa hora no existe por cambio de horario. Probá 3am."
+- **Si hora ambigua** (fall back, 2am existe dos veces): usar la primera ocurrencia
+
+**Implementación:**
+```typescript
+function validateDateTimeInTimezone(dt: Date, timezone: string): DateValidationResult {
+  const formatted = formatInTimeZone(dt, timezone, 'yyyy-MM-dd HH:mm');
+  const reparsed = parseInTimeZone(formatted, timezone);
+
+  if (Math.abs(dt.getTime() - reparsed.getTime()) > 60000) {
+    return {
+      valid: false,
+      error: 'Esa hora no existe por cambio de horario',
+      suggestion: suggestValidHour(dt, timezone)
+    };
+  }
+  return { valid: true };
+}
+```
+
+**Nota:** Esto requiere librería timezone-aware (luxon, date-fns-tz). Agregar a dependencias.
+
+---
+
 #### Gaps Identificados en Design Review (Strict Analysis)
 
 Esta sección documenta gaps encontrados en análisis estricto del diseño. Cada gap tiene una resolución propuesta integrada en el plan.
@@ -2481,6 +2858,22 @@ Esta sección documenta gaps encontrados en análisis estricto del diseño. Cada
 | G6 | "Reminders siempre se entregan" es falso | MEDIA | ✅ RESUELTO | Criterio reworded + Bug P12 + recovery manual |
 | G7 | Greeting check es post-hoc wasteful | BAJA | ✅ RESUELTO | Bug P13 + pasar info a contexto |
 | G8 | `lastUserMessageAt` source no especificado | BAJA | ✅ RESUELTO | Ver especificación abajo |
+| G9 | Timezone inválido usa fallback silencioso | ALTA | ✅ RESUELTO | Bug F1 + fallar loudly, no fallback |
+| G10 | user.md corrupto/faltante no manejado | MEDIA | ✅ RESUELTO | Bug F2 + defaults conservadores |
+| G11 | LLM timeout en proactive no especificado | MEDIA | ✅ RESUELTO | Bug F3 + timeout 10s |
+| G12 | Mutex timeout no definido | MEDIA | ✅ RESUELTO | ARCH-D1: 10s, skip sin queue |
+| G13 | Almacenamiento en local time | ALTA | ✅ RESUELTO | ARCH-D2: UTC + conversión en display |
+| G14 | "Consecutivo" en circuit breaker ambiguo | MEDIA | ✅ RESUELTO | Sin reset explícito = consecutivo |
+| G15 | P8 (greeting repetido) solo prompt-enforced | MEDIA | ✅ RESUELTO | A6: code-enforce además de prompt |
+| G16 | Confirmación de reminder faltante | ALTA | ✅ RESUELTO | A4 + PROD-R3: confirmación obligatoria |
+| G17 | Mutex scope no documentado | MEDIA | ✅ RESUELTO | ARCH-D4: Documentación explícita de qué protege el mutex |
+| G18 | State+send no atómico | ALTA | ✅ RESUELTO | F5 + save-before-send con rollback |
+| G19 | No hay garantía mínima de greeting | MEDIA | ⚠️ ACEPTADO | LLM decide, no forzamos. Documentado como limitación |
+| G20 | No hay alerting para circuit breaker | MEDIA | ✅ RESUELTO | F6 + logging ERROR si 6+ skips consecutivos |
+| G21 | proactive_state single-row no escala | BAJA | ⚠️ DIFERIDO | Agregar user_id cuando multi-user sea necesario |
+| G22 | LLM timeout no cancela request | MEDIA | ✅ RESUELTO | F4 + AbortController |
+| G23 | DST edge cases no manejados | BAJA | ✅ RESUELTO | F8 + validación con luxon/date-fns-tz |
+| G24 | SQLite corruption sin recovery | MEDIA | ✅ RESUELTO | F7 + degradación graciosa (skip tick, no crash) |
 
 **Especificación de `lastUserMessageAt` (G8):**
 
@@ -2548,7 +2941,7 @@ data/
 
 #### 3.5 Implementación: Tools de Reminders
 
-- [ ] `src/tools/reminders.ts`
+- [x] `src/tools/reminders.ts`
   - Tool: `set_reminder(message, datetime)`
     - **Mitigación P10:** Parser robusto de fechas naturales (ver especificación completa arriba)
     - Validación de timezone IANA (de user.md)
@@ -2564,18 +2957,18 @@ data/
   - Tool: `cancel_reminder(reminder_id)`
     - Soft delete (cancelled = 1)
     - Retorna mensaje cancelado para confirmación
-- [ ] `src/agent/proactive/date-parser.ts` **(NUEVO)**
+- [x] `src/agent/proactive/date-parser.ts` **(NUEVO)**
   - Parser determinístico de fechas naturales en español
   - Formatos soportados: ver tabla en especificación
   - Errores con sugerencias amigables
   - Tests unitarios para cada formato
-- [ ] Agregar tablas a schema SQL:
+- [x] Agregar tablas a schema SQL:
   - `reminders` (id, message, trigger_at, created_at, triggered, triggered_at, cancelled)
   - `proactive_state` (single row con estado del sistema)
 
 #### 3.6 Implementación: Reminder Scheduler
 
-- [ ] `src/agent/proactive/reminder-scheduler.ts`
+- [x] `src/agent/proactive/reminder-scheduler.ts`
   - Loop con `node-cron` cada 60 segundos
   - Query reminders vencidos (ventana ±5 min)
   - **Mitigación P2:** Mark triggered ANTES de enviar
@@ -2585,7 +2978,7 @@ data/
 
 #### 3.7 Implementación: Spontaneous Loop
 
-- [ ] `src/agent/proactive/spontaneous-loop.ts`
+- [x] `src/agent/proactive/spontaneous-loop.ts`
   - Loop con `node-cron` cada 15 minutos
   - **Mitigación P4:** Check quiet hours ANTES de todo (hardcoded)
   - **Mitigación P1:** Check rate limits y cooldowns
@@ -2600,11 +2993,11 @@ data/
 
 #### 3.8 Implementación: State & Context
 
-- [ ] `src/agent/proactive/state.ts`
+- [x] `src/agent/proactive/state.ts`
   - `loadProactiveState(): ProactiveState`
   - `updateProactiveState(partial): void`
   - Reset de contadores diarios/horarios
-- [ ] `src/agent/proactive/context-builder.ts`
+- [x] `src/agent/proactive/context-builder.ts`
   - Construye `SpontaneousContext` para el LLM
   - Carga fresh de lastUserMessageAt
   - Incluye top 5 facts relevantes
@@ -2614,12 +3007,12 @@ data/
 > **Nota:** Implementamos las abstracciones de canal desde Fase 3 para que Fase 4 (WhatsApp) sea plug-and-play.
 > Ver sección "Abstracciones de Canal" para las interfaces completas.
 
-- [ ] `src/interfaces/types.ts`
+- [x] `src/interfaces/types.ts`
   - `ChannelType = 'cli' | 'whatsapp' | 'telegram' | 'desktop'`
   - `IncomingMessage` interface
   - `NotificationMetadata` interface
 
-- [ ] `src/interfaces/message-router.ts`
+- [x] `src/interfaces/message-router.ts`
   ```typescript
   class MessageRouter {
     private sources: Map<ChannelType, MessageSource> = new Map();
@@ -2638,7 +3031,7 @@ data/
   - Intercepta comandos (`/quiet`, `/reminders`, etc.)
   - En Fase 3: solo CLI, routing trivial. En Fase 4: agrega WhatsApp.
 
-- [ ] `src/interfaces/cli-source.ts`
+- [x] `src/interfaces/cli-source.ts`
   ```typescript
   class CLIMessageSource implements MessageSource {
     readonly channel: ChannelType = 'cli';
@@ -2648,16 +3041,16 @@ data/
   }
   ```
 
-- [ ] `src/interfaces/cli-sink.ts`
+- [x] `src/interfaces/cli-sink.ts`
   - `CLINotificationSink` implements `NotificationSink`
   - Print con prefijo emoji (🔔 para reminders, 💬 para espontáneos)
 
-- [ ] Refactorizar `src/interfaces/cli.ts`:
+- [x] Refactorizar `src/interfaces/cli.ts`:
   - Usar `CLIMessageSource` + `MessageRouter`
   - **Eliminar** llamada directa a `brain.think()`
   - readline loop → `cliSource.emitMessage(input)`
 
-- [ ] Actualizar proactive loops para usar router:
+- [x] Actualizar proactive loops para usar router:
   - `reminder-scheduler.ts`: usar `router.sendNotification()`
   - `spontaneous-loop.ts`: usar `router.sendNotification()`
 
@@ -2732,7 +3125,9 @@ data/
 - [ ] "mañana a las 9" → tomorrow 09:00 ✓
 - [ ] "mañana a las 9:30" → tomorrow 09:30 ✓
 - [ ] "el lunes a las 10" → next Monday 10:00 ✓
+- [ ] "el lunes a las 10" (siendo hoy lunes) → PRÓXIMO lunes, NO hoy (A1)
 - [ ] "hoy a las 15" → today 15:00 ✓
+- [ ] "hoy a las 9" (siendo las 15:00) → ERROR + sugerencia "mañana a las 9" (A2)
 - [ ] "2026-02-01T15:00" → ISO directo ✓
 - [ ] "en un rato" → ERROR con sugerencia ✓
 - [ ] "a las 3" (sin día) → ERROR con sugerencia ✓
@@ -2762,34 +3157,545 @@ data/
 - [ ] Errores de parsing de fecha generan log con input y sugerencia
 
 **Invariantes:**
-- [ ] Nunca más de 2 mensajes espontáneos por hora (code-enforced)
-- [ ] Nunca más de 8 mensajes espontáneos por día (code-enforced)
+- [ ] Nunca más de 2 mensajes espontáneos por hora (code-enforced, rolling window)
+- [ ] Nunca más de 8 mensajes espontáneos por día (code-enforced, rolling window)
 - [ ] Cooldown mínimo de 30 minutos entre mensajes espontáneos (code-enforced)
 - [ ] Reminders intentan entrega incluso en quiet hours (pueden perderse en crash, ver P12)
 - [ ] Saludos solo dentro de ventanas definidas (code-enforced, no LLM-decided)
+
+**Nuevos bugs F1-F8 (de análisis de 3 perspectivas + review final):**
+- [ ] **F1 (timezone inválido):** user.md con "America/Buenos_Aire" (typo) → ERROR al startup, NO fallback silencioso
+- [ ] **F2 (user.md faltante):** Borrar user.md, iniciar → se crea con defaults, log INFO, sistema funciona
+- [ ] **F2 (user.md corrupto):** user.md con YAML inválido → log WARNING, usar defaults, sistema funciona
+- [ ] **F3 (LLM timeout):** Simular LLM lento (>10s) → tick abortado, log `spontaneous_skipped: llm_timeout`, mutex liberado
+- [ ] **F4 (AbortController):** Verificar que LLM request se CANCELA (no solo ignora) al timeout → verificar con mock que abort() fue llamado
+- [ ] **F5 (save-before-send):** Simular send failure después de save → mensaje deleted (rollback), log `message_rollback`
+- [ ] **F5 (save-before-send ok):** Send exitoso → mensaje marcado como delivered (pending=false)
+- [ ] **F6 (mutex starvation):** Simular 6+ tryAcquire failures consecutivos → log ERROR `spontaneous_starved`, counter visible en /proactive status
+- [ ] **F6 (mutex starvation reset):** Después de acquire exitoso → counter reset a 0
+- [ ] **F7 (DB error graceful):** Simular SQLite error durante tick → skip tick, log ERROR, NO crash, siguiente tick intenta de nuevo
+- [ ] **F7 (DB startup check):** Al startup con DB corrupto → log ERROR, ofrecer recrear, NO crash silencioso
+- [ ] **F8 (DST spring forward):** "mañana a las 2am" durante DST spring forward → ERROR con sugerencia de hora válida
+- [ ] **F8 (DST fall back):** "mañana a las 2am" durante DST fall back → usa primera ocurrencia, log INFO
+
+**Acciones A1-A11 verificadas:**
+- [ ] **A1:** "el lunes a las 10" cuando hoy es lunes → next Monday, NO hoy
+- [ ] **A2:** "hoy a las 9" cuando son las 15:00 → ERROR + sugerencia "mañana a las 9"
+- [ ] **A3:** Rate limits usan rolling window (verificar con múltiples ticks en edge de hora/día)
+- [ ] **A4:** set_reminder retorna "Te recuerdo a las 15:00 (GMT-3)" → LLM confirma al usuario
+- [ ] **A5:** Reminders almacenados en UTC (verificar en SQLite directamente)
+- [ ] **A6:** Greeting repetido bloqueado por código (no solo prompt) → log `greeting_blocked_duplicate`
+- [ ] **A7:** user.md template incluye sección "Known Limitations"
+- [ ] **A8:** Timeout de mutex = 10s → log si tick skipped por timeout
+- [ ] **A9:** Timezone inválido → ERROR al startup (verificado con F1)
+- [ ] **A10:** Defaults aplicados si config faltante (verificado con F2)
+- [ ] **A11:** Orden en reminder: send → mark delivered_at (verificar en código)
+
+**Decisiones arquitectónicas verificadas:**
+- [ ] **ARCH-D1:** Mutex timeout 10s para proactive tick
+- [ ] **ARCH-D2:** Almacenamiento UTC (verificar con A5)
+- [ ] **ARCH-D3:** Estado per-channel documentado para Fase 4
+
+---
+
+#### Análisis Estricto de Criterios (Pre-Implementación)
+
+> **Fecha:** 2026-01-31
+> **Contexto:** Análisis realizado ANTES de implementar, evaluando si el diseño satisface realistamente los criterios para uso diario real (no demo).
+
+##### Leyenda de Status
+
+| Status | Significado |
+|--------|-------------|
+| ✅ SATISFIED | Diseño especifica mecanismo completo y determinístico |
+| ⚠️ PARTIAL | Diseño existe pero subsespecificado o con supuestos optimistas |
+| ❌ NOT SATISFIED | Mecanismo faltante, señal unclear, o LLM haciendo trabajo crítico |
+
+---
+
+##### 1. Funcionalidad Básica (Reminders)
+
+| Criterio | Status | Análisis |
+|----------|--------|----------|
+| "recordame en 2 horas llamar a mamá" → reminder creado | ⚠️ PARTIAL | Depende de que LLM extraiga correctamente y pase `datetime="en 2 horas"` al tool. Sin fallback si LLM pasa formato diferente. |
+| "recordame mañana a las 9 revisar email" | ⚠️ PARTIAL | Mismo problema. Además: "a las 9" es ambiguo (AM/PM). Diseño dice 09:00 pero usuario podría querer 21:00. |
+| "recordame a las 3" → ERROR con sugerencia | ❌ NOT SATISFIED | Requiere que LLM **falle** en extraer datetime válido. Pero LLM puede alucinar "hoy a las 3pm" y crear reminder incorrecto. No hay validación de que LLM reportó ambigüedad fielmente. |
+| `/reminders` muestra pendientes con IDs | ✅ SATISFIED | Comando directo, implementación determinística. |
+| "cancela el reminder de mamá" | ⚠️ PARTIAL | Depende de LLM usando `find_reminder("mamá")` → `cancel_reminder(id)`. ¿Qué si múltiples reminders mencionan "mamá"? ¿Qué si LLM salta `find_reminder` y alucina un ID? |
+| Reminder dispara en ventana ±5 min | ✅ SATISFIED | Mecanismo cron determinístico con spec clara. |
+
+**Gaps identificados:**
+- **G-R1:** No hay confirmación al usuario ("Te recuerdo a las 15:00, ¿ok?") antes de crear reminder
+- **G-R2:** No hay mecanismo de undo más allá de cancelación explícita
+- **G-R3:** Si LLM malinterpreta, usuario descubre al disparar reminder en hora incorrecta
+
+---
+
+##### 2. Funcionalidad Básica (Proactividad)
+
+| Criterio | Status | Análisis |
+|----------|--------|----------|
+| Agente saluda entre 8-10am si proactivity >= medium | ⚠️ PARTIAL | Ventana de saludo es code-enforced (bien), pero **si saluda** es LLM-decided. LLM puede siempre decir "no" o elegir tipo incorrecto. No hay mecanismo para asegurar que LLM genere saludos. |
+| Agente NO habla durante quiet hours (22:00-08:00) | ✅ SATISFIED | Check ocurre **antes** de LLM call en código. Determinístico. |
+| `/quiet` silencia espontáneos pero no reminders | ✅ SATISFIED | Diferenciación code-enforced. |
+| `/quiet 2h` y `/quiet off` | ✅ SATISFIED | Parsing simple y determinístico. |
+
+**Gaps identificados:**
+- **G-P1:** "Detección de actividad" es solo `lastUserMessageAt`. Usuario puede estar usando computadora (typing elsewhere), en llamada, etc. El agente interrumpirá en momentos inapropiados.
+- **G-P2:** No hay integración con calendario, hooks de sistema, o señales externas de ocupación.
+
+---
+
+##### 3. Parsing de Fechas
+
+| Criterio | Status | Análisis |
+|----------|--------|----------|
+| "en 30 minutos" | ✅ SATISFIED | Regex-based, determinístico. |
+| "en 1 hora y 30 minutos" | ⚠️ PARTIAL | Requiere parsing compuesto. Spec lo menciona pero no muestra regex. Edge cases unclear. |
+| "mañana a las 9" | ✅ SATISFIED | Día + hora, regex straightforward. |
+| "mañana a las 9:30" | ✅ SATISFIED | Igual que arriba. |
+| "el lunes a las 10" | ⚠️ PARTIAL | "el lunes" debe resolver a **próximo** lunes. ¿Qué si hoy es lunes? ¿Significa hoy o próxima semana? Spec silente. |
+| "hoy a las 15" | ⚠️ PARTIAL | ¿Qué si ya son las 16:00? ¿Error, crea para mañana, o crea en el pasado? Spec silente. |
+| "2026-02-01T15:00" | ✅ SATISFIED | ISO parsing es estándar. |
+| "en un rato" → ERROR | ✅ SATISFIED | Explícito en lista "not supported". |
+| "a las 3" (sin día) → ERROR | ⚠️ PARTIAL | Requiere que parser detecte día faltante. Pero LLM puede "ayudar" agregando "hoy" antes de pasar al tool. |
+
+**Gaps identificados:**
+- **G-D1:** "el lunes" cuando hoy es lunes no tiene comportamiento definido
+- **G-D2:** Hora pasada (ej: "hoy a las 9" cuando son las 15) no tiene comportamiento definido
+- **G-D3:** LLM puede "normalizar" input ambiguo antes de pasarlo al tool, bypassing validación
+
+---
+
+##### 4. Mitigaciones P1-P16
+
+| Mitigación | Status | Análisis |
+|------------|--------|----------|
+| **P1 (runaway)** | ⚠️ PARTIAL | Circuit breaker después de 5 mensajes consecutivos es bueno. Pero "consecutivo" requiere tracking preciso. ¿Qué si ticks son 16 min apart (just over cooldown)? |
+| **P2 (duplicado)** | ✅ SATISFIED | Estado 3-niveles (0→1→2) con mark-before-send atómico es sólido. |
+| **P3 (stale context)** | ⚠️ PARTIAL | "Fresh load" mencionado pero depende de implementación cargando de SQLite, no valor cached. No hay mecanismo para **verificar** freshness (ej: timestamp validation). |
+| **P4 (quiet hours)** | ✅ SATISFIED | Code-enforced antes de LLM. |
+| **P5 (timezone)** | ⚠️ PARTIAL | Diseño dice "almacenar en timezone del usuario" pero esto es inusual. Mayoría de sistemas almacenan UTC y convierten al mostrar. Almacenar en tiempo local introduce bugs de DST. **No hay manejo de DST mencionado.** |
+| **P7 (race)** | ⚠️ PARTIAL | Mutex con `tryAcquire()` mencionado, pero: ¿qué si CLI mantiene mutex 30 segundos durante LLM response? ¿Proactive tick hace queue, drop, o retry? Spec dice "skip, no queue" pero no aborda escenarios de mutex held largo tiempo. |
+| **P8 (greeting repetido)** | ⚠️ PARTIAL | Trackea `lastGreetingDate` y `lastGreetingType` pero **enforcement es LLM-decided** ("regla en prompt: solo un saludo de cada tipo por día"). Prompts no son garantías. |
+| **P9 (/quiet)** | ✅ SATISFIED | Diferenciación code-enforced entre espontáneos y reminders. |
+| **P10 (datetime extraction)** | ❌ NOT SATISFIED | **PUNTO MÁS DÉBIL.** LLM debe extraer datetime de lenguaje natural y pasar al tool. LLM puede: (a) alucinar tiempo incorrecto, (b) interpretar ambiguamente, (c) pasar formato diferente al esperado. Tool solo puede validar **sintaxis**, no **corrección semántica**. |
+| **P11 (greeting window)** | ✅ SATISFIED | `isGreetingWindow` computado en código y pasado al LLM. LLM solo puede saludar si window es true. |
+| **P12 (reminder perdido)** | ⚠️ PARTIAL | `checkLostReminders()` al startup detecta triggered=1 con delivered_at=NULL. Pero si crash ocurre **después** de update de delivered_at pero **antes** de print real en CLI → perdido silenciosamente. |
+| **P13 (pre-check)** | ✅ SATISFIED | `greetingAlreadySent: true` computado antes de LLM. |
+| **P14 (messageType)** | ✅ SATISFIED | Código valida messageType antes de enviar. |
+| **P15 (freshness post-LLM)** | ✅ SATISFIED | Re-check `lastUserMessageAt` después de LLM returns, aborta si usuario activo en último 1 minuto. |
+| **P16 (mutex release)** | ✅ SATISFIED | Patrón `try/finally` documentado. |
+
+**Gaps identificados:**
+- **G-M1:** P5 (timezone) no maneja DST transitions
+- **G-M2:** P7 (race) no define comportamiento cuando mutex held por largo tiempo
+- **G-M3:** P8 (greeting) depende de LLM siguiendo prompt, no code-enforced
+- **G-M4:** P10 (datetime) pone LLM en critical path para corrección — fundamental design issue
+- **G-M5:** P12 (crash recovery) tiene ventana de pérdida silenciosa
+
+---
+
+##### 5. Observabilidad
+
+| Criterio | Status | Análisis |
+|----------|--------|----------|
+| Cada tick genera log | ✅ SATISFIED | Explícito en diseño. |
+| Cada reminder trigger logea attempting → delivered | ✅ SATISFIED | Explícito en diseño. |
+| Circuit breaker trips logean warning | ✅ SATISFIED | Explícito en diseño. |
+| Decisiones LLM logeadas | ✅ SATISFIED | Explícito en diseño. |
+| Errores de parsing logeados | ✅ SATISFIED | Explícito en diseño. |
+
+**Status:** ✅ Sección completamente satisfecha.
+
+---
+
+##### 6. Invariantes
+
+| Invariante | Status | Análisis |
+|-----------|--------|----------|
+| Nunca más de 2 espontáneos/hora | ✅ SATISFIED | Rolling window (A3). Comparación con lastSpontaneousMessageAt. |
+| Nunca más de 8 espontáneos/día | ✅ SATISFIED | Rolling window (A3). Reset a medianoche en timezone del usuario. |
+| 30 min cooldown entre espontáneos | ✅ SATISFIED | Comparación simple de timestamp, determinístico. |
+| Reminders intentan entrega en quiet hours | ✅ SATISFIED | Mencionado explícitamente. |
+| Saludos solo en ventanas definidas | ✅ SATISFIED | Code-enforced `isGreetingWindow`. |
+
+**Gaps resueltos (actualización 17):**
+- **G-I1:** ✅ Decidido: Rolling window para ambos (A3)
+- **G-I2:** ✅ Reset a medianoche en timezone del usuario (IANA)
+
+---
+
+##### Resumen de Gaps Críticos (Actualizado)
+
+###### 1. LLM como Critical Path para Corrección (⚠️ Mitigado)
+
+El diseño pone al LLM en el critical path para:
+- Extraer datetime de input del usuario (P10)
+- Decidir si saludar (P8)
+- Usar flujo correcto de tools para cancelación
+
+**Problema:** LLMs son probabilísticos. El diseño los trata como determinísticos. No hay fallback cuando comportamiento de LLM diverge.
+
+**✅ Mitigación implementada (A4, A6):**
+- A4: Confirmación explícita al usuario antes de crear reminder, mostrando hora parseada
+- A6: Code-enforce P8 (greeting repetido), no solo prompt
+
+###### 2. "Detección de Actividad" es Insuficiente (⚠️ Known Limitation)
+
+`lastUserMessageAt` es la única señal de actividad. Esto significa:
+- Usuario puede estar usando computadora (typing elsewhere) y agente interrumpe
+- Usuario puede estar en llamada y agente interrumpe
+- No hay integración con calendario, hooks de sistema
+
+Para uso diario real, esto es **insuficiente**. El agente interrumpirá en momentos inapropiados.
+
+**✅ Mitigación implementada (A7):** Documentado como known limitation en user.md template. Integración de calendario diferida a Fase 5.
+
+###### 3. Timezone/DST No Manejado (✅ Resuelto)
+
+**✅ Mitigación implementada (A5, A9, ARCH-D2):**
+- ARCH-D2: Almacenar en UTC, convertir a local solo para display
+- A9: Validar timezone IANA al startup, FALLAR LOUDLY si inválido
+- Re-leer timezone de user.md en cada operación
+
+###### 4. Crash Recovery es Incompleto (⚠️ Mejorado)
+
+`checkLostReminders()` solo detecta reminders stuck en `triggered=1`. Pero:
+- Si crash ocurre después de delivered_at update pero antes de print → perdido
+- No hay notificación al usuario de reminder perdido
+- Recovery manual (`/reminders lost`) requiere que usuario sepa que algo falta
+
+**✅ Mitigación implementada (A11):**
+- Cambiar orden: print ANTES de mark delivered_at
+- Peor caso: usuario ve reminder pero sistema cree que falló → warning innecesario (mejor que perder)
+
+###### 5. Rate Limits Ambiguos
+
+"Max 2/hora" y "max 8/día" necesitan definiciones precisas:
+- ¿Rolling window vs fixed bucket?
+- ¿Timezone del "día"?
+- ¿Qué si 7 mensajes enviados en última hora del día, nuevo día empieza, puede enviar 8 más inmediatamente?
+
+**Mitigación propuesta:**
+- Usar rolling window para ambos (simpler, más predecible)
+- Día = medianoche en timezone del usuario
+
+###### 6. No Hay Validación de Intent del Usuario
+
+Cuando usuario dice "recordame en 2 horas":
+- No hay paso de confirmación ("Te recuerdo a las 15:00, ¿ok?")
+- No hay mecanismo de undo más allá de cancel explícito
+- Si LLM malinterpreta, usuario descubre cuando reminder dispara en hora incorrecta
+
+**Mitigación propuesta:** Tool `set_reminder` retorna hora parseada, LLM **debe** confirmar al usuario antes de considerar tarea completa.
+
+---
+
+##### Veredicto
+
+**¿Fase 3 está realistamente completa según sus criterios de verificación?**
+
+**NO.**
+
+El diseño es detallado como especificación, pero:
+
+1. **~40% de criterios** dependen de LLM comportándose correctamente, lo cual no está garantizado
+2. **Mecanismos clave** (rate limit buckets, DST, "el lunes" disambiguation) están subsespecificados
+3. **Detección de actividad** es demasiado primitiva para uso diario real (solo `lastUserMessageAt`)
+4. **No hay loop de confirmación** para reminders significa que errores se descubren demasiado tarde
+
+**Para demo:** el diseño pasaría.
+**Para uso diario real:** esperar fricción, reminders perdidos, interrupciones en momentos inapropiados, y comportamiento confuso cuando LLM interpreta ambiguamente.
+
+---
+
+##### Acciones Requeridas Antes de Implementar
+
+| ID | Acción | Prioridad | Impacto |
+|----|--------|-----------|---------|
+| A1 | Definir comportamiento de "el lunes" cuando hoy es lunes | Alta | Evita reminders en día incorrecto |
+| A2 | Definir comportamiento de hora pasada ("hoy a las 9" cuando son 15:00) | Alta | Evita reminders en el pasado |
+| A3 | Decidir rolling window vs fixed bucket para rate limits | Media | Claridad de implementación |
+| A4 | Agregar confirmación explícita de hora parseada al usuario | Alta | Mitiga P10 fundamentalmente |
+| A5 | Cambiar almacenamiento a UTC + conversión en display | Media | Evita bugs de DST |
+| A6 | Code-enforce P8 (greeting repetido) en lugar de prompt-enforce | Media | Garantiza invariante |
+| A7 | Documentar "detección de actividad limitada" como known issue | Baja | Expectativas claras |
+| A8 | Agregar timeout de 10s para LLM calls en proactive loop | Alta | Evita mutex starvation |
+| A9 | Fallar loudly si timezone IANA es inválido (no fallback silencioso) | Alta | Evita reminders 3h off |
+| A10 | Definir defaults explícitos si user.md corrupto/faltante | Media | Sistema robusto |
+| A11 | Cambiar orden: print ANTES de mark delivered_at | Media | Reduce ventana de pérdida |
+| A12 | Usar AbortController para timeout de LLM | Alta | Evita resource leaks (F4) |
+| A13 | Implementar save-before-send con rollback | Alta | Historial consistente (F5) |
+| A14 | Documentar scope del mutex explícitamente | Media | Claridad de concurrencia (ARCH-D4) |
+| A15 | Agregar tracking de mutex skips consecutivos | Media | Visibilidad de starvation (F6) |
+| A16 | Agregar degradación graciosa para DB errors | Media | Resiliencia (F7) |
+| A17 | Validar DST edge cases en date parser | Baja | Correctitud 2x/año (F8) |
+| A18 | Agregar ejemplos concretos de proactivity levels | Media | UX clarity (PROD-R5) |
+
+---
+
+#### Análisis de 3 Perspectivas (Pre-Implementación)
+
+> **Fecha:** 2026-01-31
+> **Contexto:** Análisis profundo del diseño desde tres ángulos complementarios antes de escribir código.
+
+##### 🏗️ Perspectiva: Arquitecto de Sistemas
+
+**Fortalezas:**
+
+| Aspecto | Evaluación |
+|---------|------------|
+| Separación de Concerns | ✅ Excelente. ReminderScheduler (determinístico) vs SpontaneousLoop (no determinístico) tienen modos de falla diferentes, timing diferente, código separado. |
+| Abstracciones para Escalar | ✅ Bien diseñado. `NotificationSink`, `MessageRouter`, `MessageSource` permiten agregar canales sin tocar lógica core. |
+| Estado Persistente | ✅ `ProactiveState` con lazy reset es elegante. Evita cron jobs adicionales. |
+
+**Preocupaciones Arquitectónicas:**
+
+| ID | Preocupación | Severidad | Detalle |
+|----|--------------|-----------|---------|
+| ARCH-1 | LLM en critical path | 🔴 ALTA | El sistema confía en que LLM pasará datetime literalmente. No hay recovery si malinterpreta. |
+| ARCH-2 | Mutex strategy incompleta | 🟡 MEDIA | No define timeout, ni comportamiento cuando CLI mantiene mutex 30+ segundos durante streaming. |
+| ARCH-3 | Estado global vs per-channel | 🟡 MEDIA | `lastUserMessageAt` global puede ser problemático en Fase 4: si usuario activo en WhatsApp, ¿agente puede hablar por CLI? |
+| ARCH-4 | Almacenamiento en local time | 🔴 ALTA | Anti-pattern. Debe ser UTC + conversión. Local time causa bugs en DST y cambio de timezone. |
+
+**Decisiones Arquitectónicas Requeridas:**
+
+```
+ARCH-D1: Timeout de mutex
+├── Valor: 10 segundos para proactive tick
+├── Si timeout: log warning, skip tick (no queue)
+└── Razón: Evita starvation del loop proactivo
+
+ARCH-D2: Almacenamiento de tiempo
+├── Almacenar: UTC siempre
+├── Convertir: A timezone del usuario solo para display
+├── Validar: Timezone IANA al startup, fallar si inválido
+└── Razón: Evita bugs de DST, facilita multi-timezone futuro
+
+ARCH-D3: Estado per-channel (Fase 4)
+├── lastUserMessageAt: PER-CHANNEL
+├── spontaneousCountToday: GLOBAL (límite por usuario, no por canal)
+├── lastActiveChannel: GLOBAL (para routing de proactivos)
+└── Razón: Permite comportamiento inteligente multi-canal
+
+ARCH-D4: Scope del mutex (brainMutex)
+├── Protege: Llamadas al LLM (think/chat completions)
+├── NO protege: SQLite writes (tienen su propio locking)
+├── Adquisición: tryAcquire() non-blocking para proactive, acquire() blocking para CLI
+├── Timeout CLI: Sin timeout (usuario espera respuesta)
+├── Timeout Proactive: 0ms (skip si ocupado)
+└── Razón: Proactive es opcional, CLI es interactivo
+
+ARCH-D5: Atomicidad de save+send
+├── Patrón: Save (pending) → Send → Mark delivered
+├── Si send falla: Rollback (delete message)
+├── Si save falla: No send (fail early)
+├── Campo nuevo: `pending` boolean en messages
+└── Razón: Historial siempre refleja lo que el usuario vio
+
+ARCH-D6: Cancelación de requests LLM
+├── Mecanismo: AbortController + signal
+├── Timeout: 10s para proactive, sin timeout para CLI
+├── Al abortar: Log + cleanup + return gracefully
+└── Razón: Evita resource leaks y responses huérfanas
+
+ARCH-D7: Degradación graciosa ante DB errors
+├── Proactive loops: Skip tick, log ERROR, continuar
+├── Reminders: Skip reminder, log ERROR, continuar
+├── CLI: Mostrar error amigable, no crash
+├── Al startup: PRAGMA integrity_check, ofrecer recrear si falla
+└── Razón: Mejor funcionalidad parcial que crash total
+```
+
+---
+
+##### 🛠️ Perspectiva: Product Engineer
+
+**Fortalezas del MVP:**
+
+| Aspecto | Evaluación |
+|---------|------------|
+| Scope | ✅ Apropiado. Reminders + saludos contextuales + `/quiet` es viable. |
+| Debuggability | ✅ Excelente. `/proactive *` commands son oro para iteración. |
+| Logging | ✅ Comprehensivo. Cada tick genera log con reason. |
+
+**Preocupaciones de Producto:**
+
+| ID | Preocupación | Impacto en UX |
+|----|--------------|---------------|
+| PROD-1 | Tuning de "cuándo hablar" es difícil | Iteración lenta. Cambiar prompt → re-test manual → esperar horas para ver efecto. |
+| PROD-2 | Proactivity levels son abstractos | Usuario no sabe qué esperar de "medium". ¿Cuántas interrupciones? ¿A qué horas? |
+| PROD-3 | Detección de actividad primitiva | Agente interrumpirá durante videollamadas, typing elsewhere, etc. |
+| PROD-4 | Sin undo para reminders | Error de parsing se descubre al momento del trigger, demasiado tarde. |
+
+**Recomendaciones de Producto:**
+
+```
+PROD-R1: /proactive history
+├── Qué: Comando que muestra últimas N decisiones del LLM con razones
+├── Por qué: Permite ver patrones sin esperar horas
+└── Prioridad: Media (nice-to-have para Fase 3)
+
+PROD-R2: Explicación de proactivity levels
+├── Qué: En onboarding, explicar concretamente cada nivel
+├── Ejemplo: "Medium = ~2-4 mensajes/día: saludo mañana/tarde + check-ins"
+└── Prioridad: Baja (documentación, no código)
+
+PROD-R3: Confirmación obligatoria de reminders
+├── Qué: Después de crear reminder, mostrar hora parseada + opción de editar
+├── Formato: "Te recuerdo a las 15:00 - ¿correcto? (escribe otra hora para cambiar)"
+└── Prioridad: Alta (mitiga P10 fundamentalmente)
+
+PROD-R4: Known limitations comunicadas
+├── Qué: Documentar que detección de actividad es limitada
+├── Donde: En user.md template o primer mensaje de onboarding
+└── Prioridad: Media (expectativas claras)
+
+PROD-R5: Ejemplos concretos de proactivity levels (NUEVO)
+├── Qué: En user.md, explicar cada nivel con ejemplos concretos
+├── Ejemplo Medium: "1-2 mensajes en la mañana (saludo + check-in), máximo 4/día"
+├── Ejemplo High: "Saludo mañana/tarde + sugerencias contextuales, máximo 8/día"
+├── Ejemplo Low: "Solo reminders que pediste, nunca habla espontáneamente"
+└── Prioridad: Media (claridad de expectativas)
+
+PROD-R6: Garantía mínima de greeting (EVALUADO - NO IMPLEMENTAR)
+├── Propuesta: Si en ventana + no saludó + >2h sin interacción → forzar saludo
+├── Problema: Forzar output del LLM es complejo y frágil
+├── Decisión: Aceptar que LLM puede elegir no saludar
+├── Mitigación: Documentar como known behavior, no bug
+└── Prioridad: N/A (descartado)
+```
+
+---
+
+##### 💥 Perspectiva: Failure Engineer
+
+**Riesgos Críticos Rankeados:**
+
+| Rank | Bug | Probabilidad | Impacto | Mitigación Actual | Gap |
+|------|-----|--------------|---------|-------------------|-----|
+| 1 | P10: LLM malinterpreta datetime | ALTA | ALTO | Parser robusto en tool | LLM puede "resolver" ambigüedad incorrectamente antes de pasar al tool |
+| 2 | P1: Runaway loop | MEDIA | ALTO | Circuit breaker 5 consecutivos | "Consecutivo" no definido precisamente |
+| 3 | P7: Race condition | MEDIA | MEDIO | Mutex tryAcquire | Comportamiento cuando mutex held largo tiempo no definido |
+| 4 | P12: Reminder perdido | BAJA | ALTO | Estado 3-niveles + checkLostReminders | Ventana de pérdida silenciosa si crash entre mark y print |
+| 5 | P6: LLM alucina reminder | MEDIA | MEDIO | Prompt explícito | 100% confianza en prompt, sin fallback |
+
+**Nuevos Modos de Falla Identificados:**
+
+| ID | Nombre | Escenario | Severidad |
+|----|--------|-----------|-----------|
+| F1 | Timezone inválido silencioso | user.md tiene typo "America/Buenos_Aire", sistema usa UTC silenciosamente, reminders 3h off | 🔴 ALTA |
+| F2 | user.md corrupto/faltante | Archivo no existe o YAML inválido. ¿Defaults? ¿Crash? No especificado. | 🟡 MEDIA |
+| F3 | LLM timeout en proactive tick | LLM tarda 30+ segundos, mutex held, CLI bloqueado o proactive starved | 🟡 MEDIA |
+
+**Mitigaciones para Nuevos Modos:**
+
+```
+F1: Timezone inválido
+├── Mitigación: Validar timezone IANA al startup
+├── Si inválido: FALLAR LOUDLY, no usar fallback silencioso
+├── Mensaje: "Timezone 'X' no reconocido. Configurá un timezone válido en user.md"
+└── Implementación: Usar Intl.supportedValuesOf('timeZone') o lista IANA
+
+F2: user.md corrupto/faltante
+├── Mitigación: Defaults conservadores explícitos
+├── Defaults:
+│   ├── proactivityLevel: 'low' (solo reminders)
+│   ├── quietHours: 22:00-08:00
+│   ├── timezone: 'UTC' (con warning visible)
+│   └── language: 'es'
+├── Si corrupto: Log warning, usar defaults
+└── Si faltante: Crear con defaults + log info
+
+F3: LLM timeout en proactive tick
+├── Mitigación: Timeout de 10 segundos para decisiones espontáneas
+├── Si timeout: Log warning, abortar tick, liberar mutex
+├── No retry: Siguiente tick en 15 minutos
+└── Implementación: Promise.race([llmCall, timeout(10000)])
+```
+
+---
+
+##### Resumen Ejecutivo de 3 Perspectivas (Actualizado)
+
+| Perspectiva | Veredicto | Riesgos Principales | Status Post-Review |
+|-------------|-----------|---------------------|-------------------|
+| **Arquitecto** | ⚠️ Sólido con gaps | Mutex strategy, timezone storage, LLM coupling | ✅ Resuelto (ARCH-D4 a D7) |
+| **Producto** | ✅ MVP viable | Detección de actividad primitiva, tuning difícil | ✅ Documentado (PROD-R5, R6) |
+| **Fallas** | ⚠️ Riesgos conocidos | P10 (datetime LLM), P7 (race), P12 (crash window), F1-F8 | ✅ Mitigaciones definidas |
+
+**Conclusión Post-Review Final:**
+- Total bugs documentados: P1-P16 + F1-F8 = 24 modos de falla con mitigaciones
+- Total gaps: G1-G24 (22 resueltos, 2 diferidos/aceptados)
+- Total acciones: A1-A18 (integradas en plan de implementación)
+- Total decisiones arquitectónicas: ARCH-D1 a D7
+- El diseño está **listo para implementar** con todas las mitigaciones integradas en el orden de implementación
+
+---
+
+#### Resolución de Acciones A1-A18 (Consolidado)
+
+| ID | Problema Original | Resolución | Integrado En |
+|----|-------------------|------------|--------------|
+| **A1** | "el lunes" cuando hoy es lunes | PRÓXIMO lunes, NO hoy | date-parser.ts |
+| **A2** | "hoy a las 9" cuando son las 15:00 | ERROR + sugerencia "mañana a las 9" | date-parser.ts |
+| **A3** | Rolling window vs fixed bucket | Rolling window para ambos límites | spontaneous-loop.ts |
+| **A4** | Sin confirmación de hora parseada | Tool retorna hora formateada, LLM confirma | set_reminder + prompt |
+| **A5** | Almacenamiento en local time (bug DST) | UTC siempre, convertir solo para display | ARCH-D2 |
+| **A6** | Greeting repetido solo en prompt | Code-enforce además de prompt | spontaneous-loop.ts |
+| **A7** | Detección de actividad primitiva | Documentado como known limitation en user.md | user.md template |
+| **A8** | Sin timeout para LLM en proactive | 10s timeout con AbortController | spontaneous-loop.ts |
+| **A9** | Timezone inválido usa fallback silencioso | FALLAR LOUDLY, no iniciar | config-loader.ts |
+| **A10** | user.md corrupto sin defaults | Defaults conservadores explícitos | config-loader.ts |
+| **A11** | Orden: mark → print (pierde en crash) | Orden: print → mark (peor caso: warning extra) | reminder-scheduler.ts |
+| **A12** | Promise.race no cancela LLM request | AbortController + signal propagado | spontaneous-loop.ts |
+| **A13** | Send antes de save (historial inconsistente) | Save (pending) → Send → Mark delivered | ARCH-D5 |
+| **A14** | Scope del mutex no documentado | ARCH-D4 documenta qué protege | ARCH-D4 |
+| **A15** | Mutex starvation invisible | Track consecutiveMutexSkips, ERROR si ≥6 | F6, spontaneous-loop.ts |
+| **A16** | DB error crashea sistema | Degradación graciosa, skip tick | ARCH-D7 |
+| **A17** | DST edge cases no manejados | Validación con luxon/date-fns-tz | F8, date-parser.ts |
+| **A18** | Proactivity levels abstractos | Ejemplos concretos en user.md | PROD-R5, config |
+
+**Status:** ✅ Todas las acciones resueltas e integradas en el plan de implementación.
 
 ---
 
 #### Orden de Implementación Recomendado
 
 ```
-Día 1: Schema, Estado y Date Parser
+Día 1: Schema, Estado, Date Parser y Config
 ├── Agregar tablas a SQLite (reminders, proactive_state)
+│   └── NUEVO: Campo `consecutiveMutexSkips` en proactive_state (F6)
+├── Agregar campo `pending` a tabla messages (ARCH-D5)
 ├── Implementar src/agent/proactive/types.ts (interfaces completas)
+│   └── NUEVO: Incluir ProactiveState.consecutiveMutexSkips
 ├── Implementar src/agent/proactive/state.ts
+│   └── NUEVO: loadProactiveStateSafe() con try/catch (F7)
+├── Implementar src/agent/proactive/config-loader.ts (NUEVO)
+│   ├── Mitigación F1: Validar timezone IANA al startup (FALLAR LOUDLY)
+│   ├── Mitigación F2: Defaults conservadores si user.md corrupto/faltante
+│   └── Crear user.md con defaults si no existe
 ├── Implementar src/agent/proactive/date-parser.ts (P10)
 │   ├── Parser de fechas naturales con especificación completa
+│   ├── Mitigación A1: "el lunes" cuando hoy es lunes → PRÓXIMO lunes
+│   ├── Mitigación A2: hora pasada → ERROR + sugerencia "mañana a las X"
+│   ├── NUEVO A17: Validación de DST edge cases (F8)
+│   ├── ARCH-D2: Almacenar en UTC, convertir solo para display
 │   ├── Errores con sugerencias amigables
-│   └── Tests unitarios para CADA formato soportado
-├── Implementar validación de timezone IANA
-└── Tests de CRUD de estado
+│   └── Tests unitarios para CADA formato soportado (incluyendo DST)
+├── Agregar dependencia: luxon o date-fns-tz (para DST handling)
+└── Tests de CRUD de estado + validación de config
 
 Día 2: Tools de Reminders
 ├── Implementar src/tools/reminders.ts
 │   ├── set_reminder con date-parser integrado
+│   │   └── Mitigación A4: Retornar hora parseada + timezone para confirmación
 │   ├── list_reminders con formato [id:xxx]
 │   ├── find_reminder (NUEVO - busca por contenido)
 │   └── cancel_reminder con mensaje de confirmación
+├── Actualizar prompt de SOUL.md para forzar confirmación de reminders (A4)
+│   └── "Siempre confirmá la hora parseada antes de dar por creado el reminder"
 ├── Registrar todos los tools
 ├── Tests del flujo completo: "cancela el de mamá"
 │   └── Verificar: find_reminder → cancel_reminder funciona
@@ -2803,13 +3709,19 @@ Día 3: Channel Layer + Reminder Scheduler
 ├── Refactorizar src/interfaces/cli.ts para usar MessageRouter
 │   └── Eliminar llamada directa a brain.think()
 ├── Implementar src/agent/proactive/reminder-scheduler.ts
-│   └── Usar router.sendNotification() (NO sink directo)
+│   ├── Usar router.sendNotification() (NO sink directo)
+│   ├── Mitigación A11: Print ANTES de mark delivered_at (reduce ventana pérdida)
+│   └── NUEVO A13/ARCH-D5: Save-before-send con rollback (F5)
+│       ├── saveMessage(..., { pending: true })
+│       ├── send()
+│       └── Si falla: deleteMessage() rollback
 ├── Integrar con node-cron (cada 60 segundos)
 ├── Mitigación P2: Estado 3-niveles (0 → 1 → 2)
 ├── Mitigación P12: Columna delivered_at + checkLostReminders() al startup
+├── NUEVO A16/ARCH-D7: Wrap en try/catch, skip si DB error (F7)
 ├── Implementar setPendingWarning() para notificar pérdidas al usuario
 ├── Implementar /reminders lost (recovery manual)
-└── Tests end-to-end de reminders (incluyendo timezone)
+└── Tests end-to-end de reminders (incluyendo timezone con UTC storage)
 
 Día 4: Spontaneous Loop
 ├── Implementar src/agent/proactive/context-builder.ts
@@ -2819,39 +3731,60 @@ Día 4: Spontaneous Loop
 │   └── Fresh load de lastUserMessageAt desde SQLite
 ├── Implementar src/agent/proactive/decision-prompt.ts
 ├── Implementar src/agent/proactive/spontaneous-loop.ts
-│   ├── Mitigación P1: Rate limits hardcoded
+│   ├── Mitigación P1: Rate limits hardcoded (rolling window - A3)
 │   ├── Mitigación P3: Fresh context, no cache
 │   ├── Mitigación P4: Quiet hours en código
-│   ├── Mitigación P7: Mutex con tryAcquire() (NO solo check)
+│   ├── Mitigación P7: Mutex con tryAcquire() + ARCH-D1 (ARCH-D4 scope)
+│   ├── NUEVO A15/F6: Track consecutiveMutexSkips, log ERROR si ≥6
 │   ├── Mitigación P8: lastGreetingDate tracking
+│   ├── Mitigación A6: Code-enforce greeting repetido (no solo prompt)
 │   ├── Mitigación P11: Greeting window validation
 │   ├── Mitigación P13: Pre-context greeting check
 │   ├── Mitigación P14: Validar messageType antes de enviar
 │   ├── Mitigación P15: Re-check freshness post-LLM
 │   ├── Mitigación P16: try/finally para liberar mutex
-│   ├── Mark before send: Actualizar state ANTES de router.sendNotification()
+│   ├── NUEVO A12/F4: AbortController para timeout LLM (NO Promise.race solo)
+│   │   ├── const controller = new AbortController()
+│   │   ├── setTimeout(() => controller.abort(), 10000)
+│   │   └── Propagar signal a LLM client
+│   ├── NUEVO A13/ARCH-D5: Save-before-send con rollback (F5)
+│   ├── NUEVO A16/ARCH-D7: Wrap en try/catch, skip si DB error (F7)
 │   └── NO implementar post-check P6 naive (ver decisión)
 ├── Usar router.sendNotification() (NO sink directo)
-└── Tests con /proactive tick
+└── Tests con /proactive tick (incluyendo mutex starvation scenario)
 
 Día 5: Comandos y Polish
 ├── Implementar /quiet [duration] (con "off")
 ├── Implementar /reminders (list, clear)
 ├── Implementar /reminders lost (P12 recovery)
-├── Implementar /proactive (debug: status, tick, context, decide, reset)
+├── Implementar /proactive (debug: status, tick, context, decide, reset, history)
+│   ├── PROD-R1: /proactive history muestra últimas N decisiones con razones
+│   └── NUEVO: Mostrar consecutiveMutexSkips en status (F6)
 ├── Actualizar user.md template con:
-│   ├── Communication Preferences (Proactivity, Quiet hours, Timezone)
-│   └── Channel Preferences (Primary channel, per-channel notifications)
+│   ├── Communication Preferences (Proactivity, Quiet hours, Timezone IANA)
+│   ├── Channel Preferences (Primary channel, per-channel notifications)
+│   ├── Mitigación A7: Sección "Known Limitations" documentando detección primitiva
+│   └── NUEVO A18/PROD-R5: Ejemplos concretos de cada proactivity level
+├── Documentar scope del mutex (A14/ARCH-D4) en código y README
 ├── Logging completo:
 │   ├── Cada tick con reason de skip/proceed
 │   ├── reminder_attempting + reminder_delivered separados (P12)
 │   ├── Errores de parsing con sugerencia
-│   └── Circuit breaker trips
+│   ├── Circuit breaker trips
+│   ├── LLM timeouts con AbortController (F4)
+│   ├── NUEVO: Mutex starvation (consecutive skips ≥6) como ERROR (F6)
+│   ├── NUEVO: DB errors con graceful degradation (F7)
+│   └── NUEVO: Message rollback events (F5)
 ├── Verificación de TODOS los criterios (ver lista extendida arriba)
-│   ├── Tests de parsing de fechas (9 casos)
+│   ├── Tests de parsing de fechas (9 casos + A1, A2 + DST F8)
 │   ├── Tests de cancelación por descripción
-│   ├── Tests de mitigaciones P1-P16 (todos)
-│   └── Tests de invariantes
+│   ├── Tests de mitigaciones P1-P16, F1-F8 (todos)
+│   ├── Tests de invariantes
+│   ├── Tests de validación de config (F1, F2)
+│   ├── NUEVO: Test de AbortController cancel (F4)
+│   ├── NUEVO: Test de save-before-send rollback (F5)
+│   ├── NUEVO: Test de mutex starvation alerting (F6)
+│   └── NUEVO: Test de DB error graceful degradation (F7)
 └── Commit final Fase 3
 ```
 
@@ -3519,7 +4452,19 @@ Esta sección documenta limitaciones arquitectónicas que son **aceptables para 
 20. [x] **Design review FASE 3** (arquitectura, separation of concerns, extensibilidad)
 21. [x] **Pre-mortem FASE 3** (16 bugs identificados: P1-P16 + mitigaciones)
 22. [x] **Definir interfaces** (ProactiveConfig, ProactiveState, NotificationSink)
-23. [x] **Análisis pre-implementación** (3 perspectivas: architect, product, failure)
+23. [x] **Análisis pre-implementación estricto** (criterios de verificación evaluados)
+24. [x] **Análisis de 3 perspectivas** (Arquitecto, Producto, Failure Engineer - actualización 17)
+    - 3 nuevos bugs identificados (F1-F3)
+    - 4 nuevas acciones requeridas (A8-A11)
+    - 8 nuevos gaps documentados (G9-G16)
+    - 3 decisiones arquitectónicas formalizadas (ARCH-D1 a D3)
+25. [x] **Review final FASE 3** (operacionalización y failure modes - actualización 18)
+    - 5 nuevos bugs identificados (F4-F8): AbortController, save ordering, mutex starvation, DB corruption, DST
+    - 8 nuevos gaps documentados (G17-G24)
+    - 4 nuevas decisiones arquitectónicas (ARCH-D4 a D7)
+    - 7 nuevas acciones requeridas (A12-A18)
+    - 2 nuevas recomendaciones de producto (PROD-R5, R6)
+    - Dependencia nueva: luxon/date-fns-tz para DST
 
 ### Pre-requisitos FASE 3 (antes de código)
 24. [x] **Especificación completa de date parser** → Tabla de formatos soportados/no soportados con errores
@@ -3530,54 +4475,88 @@ Esta sección documenta limitaciones arquitectónicas que son **aceptables para 
 29. [x] **Especificar reset lazy de contadores** → dateOfLastDailyCount, hourOfLastHourlyCount
 30. [x] **Especificar detección de reminders perdidos** → checkLostReminders() al startup
 31. [x] **Agregar validaciones post-LLM** → P14 (messageType), P15 (re-check freshness)
-32. [ ] Actualizar user.md template con campos de Communication Preferences (proactivity level, quiet hours, timezone IANA)
-33. [ ] Decidir implementación de cron (node-cron vs setInterval)
-34. [ ] Escribir tests unitarios para date-parser ANTES de implementar (TDD)
+32. [x] **Análisis de 3 perspectivas** → Arquitecto, Producto, Failure (completado actualización 17)
+33. [x] Actualizar user.md template con campos de Communication Preferences (proactivity level, quiet hours, timezone IANA)
+34. [x] Decidir implementación de cron (node-cron vs setInterval) → **setInterval** (ver razones abajo)
+35. [x] Escribir tests unitarios para date-parser ANTES de implementar (TDD)
+
+#### Decisión: setInterval vs node-cron
+
+**Elegido: setInterval**
+
+| Criterio | setInterval | node-cron |
+|----------|-------------|-----------|
+| Complejidad | Minimal | Añade dependencia |
+| Casos de uso | Intervalos fijos (60s, 15min) | Expresiones cron complejas |
+| DST handling | Manual en date-parser | También manual |
+| Testing | Fácil de mockear | Requiere más setup |
+
+**Razón:** Ambos schedulers (reminders cada 60s, spontaneous cada 15min) usan intervalos simples. No necesitamos "every Tuesday at 3pm". Menos dependencias = menos surface area para bugs.
+
+### Acciones Requeridas Pre-Implementación (de análisis de 3 perspectivas + review final)
+36. [ ] **A1:** Definir comportamiento de "el lunes" cuando hoy es lunes → PRÓXIMO lunes
+37. [ ] **A2:** Definir comportamiento de hora pasada → ERROR + sugerencia "mañana a las X"
+38. [ ] **A3:** Decidir rolling window vs fixed bucket → Rolling window para ambos
+39. [ ] **A4:** Agregar confirmación de hora parseada al usuario (CRÍTICO para P10)
+40. [ ] **A5:** Cambiar almacenamiento a UTC + conversión en display (ARCH-D2)
+41. [ ] **A6:** Code-enforce P8 (greeting repetido) → check en código, no solo prompt
+42. [ ] **A7:** Documentar "detección de actividad limitada" como known issue
+43. [ ] **A8:** Agregar timeout 10s para LLM calls en proactive loop (F3)
+44. [ ] **A9:** Fallar loudly si timezone inválido, no fallback silencioso (F1)
+45. [ ] **A10:** Defaults explícitos si user.md corrupto/faltante (F2)
+46. [ ] **A11:** Cambiar orden: print ANTES de mark delivered_at (P12 refinado)
+47. [ ] **A12:** Usar AbortController para timeout de LLM, no solo Promise.race (F4)
+48. [ ] **A13:** Implementar save-before-send con rollback para mensajes (F5, ARCH-D5)
+49. [ ] **A14:** Documentar scope del mutex explícitamente (ARCH-D4)
+50. [ ] **A15:** Agregar tracking de consecutiveMutexSkips + alerting (F6)
+51. [ ] **A16:** Implementar degradación graciosa para DB errors (F7, ARCH-D7)
+52. [ ] **A17:** Validar DST edge cases en date parser con luxon/date-fns-tz (F8)
+53. [ ] **A18:** Agregar ejemplos concretos de proactivity levels en user.md (PROD-R5)
 
 ### Implementación FASE 3
-30. [ ] **Día 1:** Schema, Estado y Date Parser
-    - [ ] Agregar tablas a SQLite (reminders, proactive_state)
-    - [ ] Implementar `src/agent/proactive/types.ts`
-    - [ ] Implementar `src/agent/proactive/state.ts`
-    - [ ] Implementar `src/agent/proactive/date-parser.ts` con tests
-    - [ ] Implementar validación de timezone IANA
-    - [ ] Tests de CRUD de estado
-31. [ ] **Día 2:** Tools de Reminders
-    - [ ] Implementar `src/tools/reminders.ts` (set, list, find, cancel)
-    - [ ] Integrar date-parser en set_reminder
-    - [ ] Implementar find_reminder (búsqueda por contenido)
-    - [ ] Registrar tools
-    - [ ] Tests del flujo "cancela el de mamá"
-38. [ ] **Día 3:** Reminder Scheduler
-    - [ ] Implementar `src/agent/proactive/reminder-scheduler.ts`
-    - [ ] Integrar con node-cron (cada 1 min)
-    - [ ] Implementar CLINotificationSink
-    - [ ] Mitigación P2: Mark before send (estado 3-niveles: 0→1→2)
-    - [ ] Mitigación P12: Columna delivered_at + checkLostReminders() al startup
-    - [ ] Implementar setPendingWarning() para notificar pérdidas
-    - [ ] Implementar `/reminders lost` (recovery manual)
-    - [ ] Tests end-to-end de reminders (incluyendo timezone)
-39. [ ] **Día 4:** Spontaneous Loop
-    - [ ] Implementar `src/agent/proactive/context-builder.ts`
-        - [ ] Incluir isGreetingWindow, greetingAlreadySentToday (P11, P13)
-        - [ ] Incluir pendingRemindersList con formato claro (P6)
-    - [ ] Implementar `src/agent/proactive/greeting-windows.ts`
-    - [ ] Implementar `src/agent/proactive/decision-prompt.ts`
-    - [ ] Implementar `src/agent/proactive/spontaneous-loop.ts`
-        - [ ] Mutex con tryAcquire + try/finally (P7, P16)
-        - [ ] Validación de messageType (P14)
-        - [ ] Re-check freshness post-LLM (P15)
-        - [ ] Update state ANTES de send (mark before send pattern)
-    - [ ] Mitigaciones P1, P3, P4, P7, P8, P11, P13, P14, P15, P16
-    - [ ] Tests con `/proactive tick`
-40. [ ] **Día 5:** Comandos y Polish
-    - [ ] Implementar `/quiet [duration]` con "off"
-    - [ ] Implementar `/reminders`, `/reminders clear`, `/reminders lost`
-    - [ ] Implementar `/proactive` (debug: status, tick, context, decide, reset)
-    - [ ] Actualizar user.md template con config (timezone IANA obligatorio)
-    - [ ] Logging completo de todas las decisiones
-    - [ ] Verificación de TODOS los criterios (P1-P16 + parsing + invariantes)
-    - [ ] Commit final Fase 3
+30. [x] **Día 1:** Schema, Estado y Date Parser
+    - [x] Agregar tablas a SQLite (reminders, proactive_state)
+    - [x] Implementar `src/agent/proactive/types.ts`
+    - [x] Implementar `src/agent/proactive/state.ts`
+    - [x] Implementar `src/agent/proactive/date-parser.ts` con tests
+    - [x] Implementar validación de timezone IANA
+    - [x] Tests de CRUD de estado
+31. [x] **Día 2:** Tools de Reminders
+    - [x] Implementar `src/tools/reminders.ts` (set, list, find, cancel)
+    - [x] Integrar date-parser en set_reminder
+    - [x] Implementar find_reminder (búsqueda por contenido)
+    - [x] Registrar tools
+    - [x] Tests del flujo "cancela el de mamá"
+38. [x] **Día 3:** Reminder Scheduler
+    - [x] Implementar `src/agent/proactive/reminder-scheduler.ts`
+    - [x] Integrar con node-cron (cada 1 min)
+    - [x] Implementar CLINotificationSink
+    - [x] Mitigación P2: Mark before send (estado 3-niveles: 0→1→2)
+    - [x] Mitigación P12: Columna delivered_at + checkLostReminders() al startup
+    - [x] Implementar setPendingWarning() para notificar pérdidas
+    - [x] Implementar `/reminders lost` (recovery manual)
+    - [x] Tests end-to-end de reminders (incluyendo timezone)
+39. [x] **Día 4:** Spontaneous Loop
+    - [x] Implementar `src/agent/proactive/context-builder.ts`
+        - [x] Incluir isGreetingWindow, greetingAlreadySentToday (P11, P13)
+        - [x] Incluir pendingRemindersList con formato claro (P6)
+    - [x] Implementar `src/agent/proactive/greeting-windows.ts`
+    - [x] Implementar `src/agent/proactive/decision-prompt.ts`
+    - [x] Implementar `src/agent/proactive/spontaneous-loop.ts`
+        - [x] Mutex con tryAcquire + try/finally (P7, P16)
+        - [x] Validación de messageType (P14)
+        - [x] Re-check freshness post-LLM (P15)
+        - [x] Update state ANTES de send (mark before send pattern)
+    - [x] Mitigaciones P1, P3, P4, P7, P8, P11, P13, P14, P15, P16
+    - [x] Tests con `/proactive tick`
+40. [x] **Día 5:** Comandos y Polish
+    - [x] Implementar `/quiet [duration]` con "off"
+    - [x] Implementar `/reminders`, `/reminders clear`, `/reminders lost`
+    - [x] Implementar `/proactive` (debug: status, tick, context, decide, reset)
+    - [x] Actualizar user.md template con config (timezone IANA obligatorio)
+    - [x] Logging completo de todas las decisiones
+    - [x] Verificación de TODOS los criterios (P1-P16 + parsing + invariantes)
+    - [x] Commit final Fase 3
 
 ### Design Review FASE 4 (Pre-Multi-Canal)
 
@@ -3615,6 +4594,130 @@ Análisis arquitectónico realizado ANTES de comenzar Fase 4 para asegurar que l
 ---
 
 ## Changelog
+
+### 2026-01-31 (actualización 18) - Review Final FASE 3 (3 Perspectivas Profundizado)
+
+**Análisis final pre-implementación con foco en operacionalización y failure modes.**
+
+**Nuevos Bugs Identificados (F4-F8):**
+- F4: LLM timeout con Promise.race no cancela el request (resource leak)
+- F5: Message persistence ordering - save después de send causa context drift
+- F6: Mutex starvation - 3+ tryAcquire failures consecutivos = loop muerto sin alerting
+- F7: SQLite corruption no manejado - crash sin recovery
+- F8: DST edge cases en date parsing - horas que no existen
+
+**Nuevos Gaps Identificados (G17-G24):**
+- G17: Mutex scope no documentado
+- G18: State+send no atómico
+- G19: No hay garantía mínima de greeting (ACEPTADO como limitación)
+- G20: No hay alerting para circuit breaker/starvation
+- G21: proactive_state single-row no escala (DIFERIDO)
+- G22-G24: Resoluciones de F4, F7, F8
+
+**Nuevas Decisiones Arquitectónicas (ARCH-D4 a D7):**
+- ARCH-D4: Scope del mutex documentado explícitamente
+- ARCH-D5: Atomicidad save+send con rollback
+- ARCH-D6: AbortController para cancelar requests LLM
+- ARCH-D7: Degradación graciosa ante DB errors
+
+**Nuevas Acciones (A12-A18):**
+- A12: AbortController para LLM timeout
+- A13: Save-before-send con rollback
+- A14: Documentar mutex scope
+- A15: Track consecutiveMutexSkips + alerting
+- A16: Degradación graciosa para DB errors
+- A17: Validar DST edge cases
+- A18: Ejemplos concretos de proactivity levels
+
+**Nuevas Recomendaciones de Producto (PROD-R5, R6):**
+- PROD-R5: Ejemplos concretos para cada proactivity level
+- PROD-R6: Garantía mínima de greeting (EVALUADA Y DESCARTADA)
+
+**Dependencias nuevas:**
+- luxon o date-fns-tz para manejo correcto de DST
+
+**Orden de implementación actualizado** con todos los items nuevos integrados en Días 1-5.
+
+---
+
+### 2026-01-31 (actualización 17) - Análisis de 3 Perspectivas FASE 3
+
+**Análisis profundo del diseño desde tres ángulos complementarios:**
+
+**1. Arquitecto de Sistemas:**
+- ✅ Separación de concerns excelente (Reminder vs Spontaneous)
+- ✅ Abstracciones preparadas para escalar (NotificationSink, MessageRouter)
+- 🔴 ARCH-1: LLM en critical path para corrección (sin recovery)
+- 🔴 ARCH-4: Almacenamiento en local time es anti-pattern
+- 🟡 ARCH-2: Mutex strategy incompleta (timeout no definido)
+- 🟡 ARCH-3: Estado global puede ser problemático en Fase 4
+
+**2. Product Engineer:**
+- ✅ MVP viable con scope apropiado
+- ✅ Debuggability excelente (`/proactive *` commands)
+- ⚠️ PROD-1: Tuning de comportamiento es difícil
+- ⚠️ PROD-3: Detección de actividad primitiva
+- ⚠️ PROD-4: Sin undo para reminders
+
+**3. Failure Engineer:**
+- 3 nuevos modos de falla identificados: F1 (timezone inválido), F2 (user.md corrupto), F3 (LLM timeout)
+- Ranking de riesgos: P10 > P1 > P7 > P12 > P6
+- Mitigaciones específicas agregadas para F1-F3
+
+**Acciones agregadas (A8-A11):**
+- A8: Timeout 10s para LLM calls en proactive loop
+- A9: Fallar loudly si timezone inválido
+- A10: Defaults explícitos si user.md corrupto
+- A11: Cambiar orden: print ANTES de mark delivered_at
+
+**Decisiones arquitectónicas documentadas:**
+- ARCH-D1: Timeout de mutex (10s, skip sin queue)
+- ARCH-D2: Almacenamiento UTC + conversión en display
+- ARCH-D3: Estado per-channel para Fase 4
+
+**Nueva sección agregada:** "Análisis de 3 Perspectivas (Pre-Implementación)" con formato estructurado.
+
+---
+
+### 2026-01-31 (actualización 16) - Análisis Estricto Pre-Implementación FASE 3
+
+**Evaluación rigurosa de criterios de verificación** — análisis realista para uso diario, no demo.
+
+**Metodología:**
+- Cada criterio evaluado como: ✅ SATISFIED, ⚠️ PARTIAL, ❌ NOT SATISFIED
+- Criterio: ¿El diseño especifica mecanismo completo y determinístico?
+- Supuesto: Esto será usado por usuario real en trabajo diario
+
+**Resultados por sección:**
+- Funcionalidad básica (reminders): 2/6 ✅, 3/6 ⚠️, 1/6 ❌
+- Funcionalidad básica (proactividad): 3/4 ✅, 1/4 ⚠️
+- Parsing de fechas: 5/9 ✅, 4/9 ⚠️
+- Mitigaciones P1-P16: 9/14 ✅, 4/14 ⚠️, 1/14 ❌
+- Observabilidad: 5/5 ✅
+- Invariantes: 3/5 ✅, 2/5 ⚠️
+
+**Gaps críticos identificados:**
+1. **LLM como critical path** — P10 (datetime extraction) depende de LLM probabilístico para corrección
+2. **Detección de actividad primitiva** — Solo `lastUserMessageAt`, no calendario/hooks
+3. **Timezone/DST no manejado** — Almacenamiento en local time introduce bugs
+4. **Crash recovery incompleto** — Ventana de pérdida silenciosa existe
+5. **Rate limits ambiguos** — Rolling window vs fixed bucket no especificado
+6. **No hay confirmación de intent** — Usuario descubre error de parsing al disparar reminder
+
+**7 acciones requeridas antes de implementar:**
+- A1: Definir "el lunes" cuando hoy es lunes
+- A2: Definir hora pasada ("hoy a las 9" cuando son 15:00)
+- A3: Decidir rolling window vs fixed bucket
+- A4: Agregar confirmación explícita de hora parseada
+- A5: Cambiar a UTC + conversión en display
+- A6: Code-enforce P8 (greeting repetido)
+- A7: Documentar detección limitada como known issue
+
+**Veredicto:** Diseño pasa para demo, NO para uso diario real sin las acciones listadas.
+
+**Nueva sección agregada:** "Análisis Estricto de Criterios (Pre-Implementación)" después de criterios de verificación.
+
+---
 
 ### 2026-01-31 (actualización 15) - Fase 3 Unificada (Multi-Canal desde el inicio)
 

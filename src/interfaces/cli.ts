@@ -1,118 +1,131 @@
-import * as readline from 'readline';
-import { think } from '../agent/brain.js';
-import { clearHistory } from '../memory/store.js';
+/**
+ * CLI Interface
+ *
+ * Terminal interface using the channel layer architecture.
+ * Integrates with MessageRouter for message processing
+ * and proactive loops for autonomous behavior.
+ */
+
+import { CLIMessageSource } from './cli-source.js';
+import { CLINotificationSink } from './cli-sink.js';
+import { getMessageRouter } from './message-router.js';
+import { DefaultCommandHandler } from './command-handler.js';
+import { startReminderScheduler, stopReminderScheduler } from '../agent/proactive/reminder-scheduler.js';
+import {
+  startSpontaneousLoop,
+  stopSpontaneousLoop,
+  setBrainProcessing,
+} from '../agent/proactive/spontaneous-loop.js';
+import { loadProactiveConfig } from './config-loader.js';
+import { initializeProactiveState } from '../memory/store.js';
 import { createLogger } from '../utils/logger.js';
 
 const logger = createLogger('cli');
 
-const PROMPT = '\x1b[36mVos:\x1b[0m ';
-const AGENT_PREFIX = '\x1b[33mSidecar:\x1b[0m ';
-const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+// Components
+let cliSource: CLIMessageSource | null = null;
+let cliSink: CLINotificationSink | null = null;
 
-function createSpinner(message: string): { stop: () => void } {
-  let i = 0;
-  const interval = setInterval(() => {
-    const frame = SPINNER_FRAMES[i % SPINNER_FRAMES.length];
-    process.stdout.write(`\r\x1b[33m${frame}\x1b[0m ${message}`);
-    i++;
-  }, 80);
-
-  return {
-    stop: () => {
-      clearInterval(interval);
-      process.stdout.write('\r\x1b[K');
-    },
-  };
-}
-
+/**
+ * Print welcome message.
+ */
 function printWelcome(): void {
   console.log('\n\x1b[1m=== Sidecar ===\x1b[0m');
   console.log('Tu compañero AI local');
-  console.log('Comandos: /clear (limpiar historial), /exit (salir)\n');
+  console.log('Comandos: /help (ayuda), /quiet (silenciar), /exit (salir)\n');
 }
 
-function printResponse(response: string): void {
-  console.log(`\n${AGENT_PREFIX}${response}\n`);
-}
-
-function printError(message: string): void {
-  console.log(`\n\x1b[31mError:\x1b[0m ${message}\n`);
-}
-
-async function handleCommand(command: string): Promise<boolean> {
-  const cmd = command.toLowerCase().trim();
-
-  switch (cmd) {
-    case '/exit':
-    case '/quit':
-    case '/q':
-      console.log('\nChau!\n');
-      return false;
-
-    case '/clear':
-      clearHistory();
-      console.log('\nHistorial limpiado.\n');
-      return true;
-
-    case '/help':
-      console.log('\nComandos disponibles:');
-      console.log('  /clear  - Limpiar historial de conversación');
-      console.log('  /exit   - Salir del programa');
-      console.log('  /help   - Mostrar esta ayuda\n');
-      return true;
-
-    default:
-      console.log(`\nComando desconocido: ${command}\n`);
-      return true;
-  }
-}
-
+/**
+ * Start the CLI interface with proactive loops.
+ */
 export async function startCLI(): Promise<void> {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
+  logger.info('Starting CLI interface...');
 
-  printWelcome();
+  // Initialize proactive state in database
+  initializeProactiveState();
 
-  const prompt = (): void => {
-    rl.question(PROMPT, async (input) => {
-      const trimmedInput = input.trim();
+  // Load configuration
+  const proactiveConfig = loadProactiveConfig();
 
-      if (!trimmedInput) {
-        prompt();
-        return;
-      }
+  // Create components
+  cliSource = new CLIMessageSource();
+  cliSink = new CLINotificationSink();
 
-      if (trimmedInput.startsWith('/')) {
-        const shouldContinue = await handleCommand(trimmedInput);
-        if (shouldContinue) {
-          prompt();
-        } else {
-          rl.close();
-        }
-        return;
-      }
+  // Get message router
+  const router = getMessageRouter();
 
-      const spinner = createSpinner('Pensando...');
+  // Register source and sink
+  router.registerSource(cliSource);
+  router.registerSink(cliSink);
+
+  // Register command handler
+  const commandHandler = new DefaultCommandHandler(
+    process.env.NODE_ENV === 'development'
+  );
+  router.registerCommandHandler(commandHandler);
+
+  // Set up processing indicator for spontaneous loop
+  const originalOnMessage = cliSource.onMessage.bind(cliSource);
+  cliSource.onMessage = (handler) => {
+    originalOnMessage(async (msg) => {
+      setBrainProcessing(true);
       try {
-        const response = await think(trimmedInput);
-        spinner.stop();
-        printResponse(response);
-      } catch (error) {
-        spinner.stop();
-        const errorMessage = error instanceof Error ? error.message : 'Error desconocido';
-        logger.error('Error processing input', error);
-        printError(errorMessage);
+        await handler(msg);
+      } finally {
+        setBrainProcessing(false);
       }
-
-      prompt();
     });
   };
 
-  rl.on('close', () => {
-    process.exit(0);
+  // Start router
+  router.start();
+
+  // Print welcome
+  printWelcome();
+
+  // Start proactive loops if proactivity level > low
+  if (proactiveConfig.proactivityLevel !== 'low') {
+    logger.info('Starting proactive loops', {
+      level: proactiveConfig.proactivityLevel,
+    });
+    startReminderScheduler();
+    startSpontaneousLoop(proactiveConfig);
+  } else {
+    // Still start reminder scheduler even with low proactivity
+    // (reminders are explicit user requests, not spontaneous)
+    logger.info('Starting reminder scheduler only (proactivity=low)');
+    startReminderScheduler();
+  }
+
+  // Start the CLI source (this starts the readline loop)
+  cliSource.start();
+
+  // Handle graceful shutdown
+  process.on('SIGINT', async () => {
+    await shutdown();
   });
 
-  prompt();
+  process.on('SIGTERM', async () => {
+    await shutdown();
+  });
 }
+
+/**
+ * Graceful shutdown.
+ */
+async function shutdown(): Promise<void> {
+  logger.info('Shutting down...');
+
+  // Stop proactive loops
+  stopReminderScheduler();
+  stopSpontaneousLoop();
+
+  // Stop router
+  const router = getMessageRouter();
+  await router.stop();
+
+  console.log('\nChau!\n');
+  process.exit(0);
+}
+
+export default startCLI;

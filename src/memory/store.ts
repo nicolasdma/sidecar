@@ -16,6 +16,47 @@ const SCHEMA = `
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
   CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at DESC);
+
+  -- Reminders table for Fase 3 proactive system
+  CREATE TABLE IF NOT EXISTS reminders (
+    id TEXT PRIMARY KEY,
+    message TEXT NOT NULL,
+    trigger_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    triggered INTEGER NOT NULL DEFAULT 0,
+    triggered_at TEXT,
+    cancelled INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE INDEX IF NOT EXISTS idx_reminders_trigger_at ON reminders(trigger_at);
+  CREATE INDEX IF NOT EXISTS idx_reminders_triggered ON reminders(triggered);
+
+  -- Proactive state table (single row)
+  CREATE TABLE IF NOT EXISTS proactive_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    last_spontaneous_message_at TEXT,
+    last_reminder_message_at TEXT,
+    spontaneous_count_today INTEGER NOT NULL DEFAULT 0,
+    spontaneous_count_this_hour INTEGER NOT NULL DEFAULT 0,
+    date_of_last_daily_count TEXT,
+    hour_of_last_hourly_count INTEGER,
+    consecutive_ticks_with_message INTEGER NOT NULL DEFAULT 0,
+    circuit_breaker_tripped_until TEXT,
+    consecutive_mutex_skips INTEGER NOT NULL DEFAULT 0,
+    last_user_message_at TEXT,
+    last_user_activity_at TEXT,
+    last_greeting_type TEXT,
+    last_greeting_date TEXT,
+    quiet_mode_until TEXT
+  );
+
+  -- Spontaneous messages log for rate limiting
+  CREATE TABLE IF NOT EXISTS spontaneous_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sent_at TEXT NOT NULL DEFAULT (datetime('now')),
+    message_type TEXT NOT NULL,
+    content TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_spontaneous_sent_at ON spontaneous_messages(sent_at);
 `;
 
 interface MessageRow {
@@ -174,4 +215,241 @@ export function closeDatabase(): void {
     db = null;
     logger.info('Database connection closed');
   }
+}
+
+// ============= Reminder Functions (Fase 3) =============
+
+export interface ReminderRow {
+  id: string;
+  message: string;
+  trigger_at: string;
+  created_at: string;
+  triggered: number;
+  triggered_at: string | null;
+  cancelled: number;
+}
+
+export function saveReminder(reminder: {
+  id: string;
+  message: string;
+  triggerAt: Date;
+}): void {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    INSERT INTO reminders (id, message, trigger_at)
+    VALUES (?, ?, ?)
+  `);
+  stmt.run(reminder.id, reminder.message, reminder.triggerAt.toISOString());
+  logger.debug('Saved reminder', { id: reminder.id, triggerAt: reminder.triggerAt });
+}
+
+export function getReminder(id: string): ReminderRow | null {
+  const database = getDatabase();
+  const stmt = database.prepare('SELECT * FROM reminders WHERE id = ?');
+  return (stmt.get(id) as ReminderRow) ?? null;
+}
+
+export function getPendingReminders(): ReminderRow[] {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    SELECT * FROM reminders
+    WHERE triggered = 0 AND cancelled = 0
+    ORDER BY trigger_at ASC
+  `);
+  return stmt.all() as ReminderRow[];
+}
+
+export function getDueReminders(windowMinutes: number = 5): ReminderRow[] {
+  const database = getDatabase();
+  const now = new Date();
+  const windowMs = windowMinutes * 60 * 1000;
+  const windowStart = new Date(now.getTime() - windowMs);
+  const windowEnd = new Date(now.getTime() + windowMs);
+
+  const stmt = database.prepare(`
+    SELECT * FROM reminders
+    WHERE triggered = 0 AND cancelled = 0
+      AND trigger_at >= ? AND trigger_at <= ?
+    ORDER BY trigger_at ASC
+  `);
+  return stmt.all(windowStart.toISOString(), windowEnd.toISOString()) as ReminderRow[];
+}
+
+export function markReminderTriggered(id: string, status: 1 | 2): void {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    UPDATE reminders
+    SET triggered = ?, triggered_at = datetime('now')
+    WHERE id = ?
+  `);
+  stmt.run(status, id);
+  logger.debug('Marked reminder triggered', { id, status });
+}
+
+export function cancelReminder(id: string): boolean {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    UPDATE reminders
+    SET cancelled = 1
+    WHERE id = ? AND triggered = 0
+  `);
+  const result = stmt.run(id);
+  if (result.changes > 0) {
+    logger.debug('Cancelled reminder', { id });
+    return true;
+  }
+  return false;
+}
+
+export function cancelAllReminders(): number {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    UPDATE reminders
+    SET cancelled = 1
+    WHERE triggered = 0 AND cancelled = 0
+  `);
+  const result = stmt.run();
+  logger.info('Cancelled all pending reminders', { count: result.changes });
+  return result.changes;
+}
+
+export function findRemindersByContent(query: string): ReminderRow[] {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    SELECT * FROM reminders
+    WHERE triggered = 0 AND cancelled = 0
+      AND message LIKE ?
+    ORDER BY trigger_at ASC
+  `);
+  return stmt.all(`%${query}%`) as ReminderRow[];
+}
+
+export function getLostReminders(): ReminderRow[] {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    SELECT * FROM reminders
+    WHERE triggered = 1 AND triggered_at IS NOT NULL
+  `);
+  return stmt.all() as ReminderRow[];
+}
+
+// ============= Proactive State Functions (Fase 3) =============
+
+export interface ProactiveStateRow {
+  id: number;
+  last_spontaneous_message_at: string | null;
+  last_reminder_message_at: string | null;
+  spontaneous_count_today: number;
+  spontaneous_count_this_hour: number;
+  date_of_last_daily_count: string | null;
+  hour_of_last_hourly_count: number | null;
+  consecutive_ticks_with_message: number;
+  circuit_breaker_tripped_until: string | null;
+  consecutive_mutex_skips: number;
+  last_user_message_at: string | null;
+  last_user_activity_at: string | null;
+  last_greeting_type: string | null;
+  last_greeting_date: string | null;
+  quiet_mode_until: string | null;
+}
+
+export function getProactiveState(): ProactiveStateRow | null {
+  const database = getDatabase();
+  const stmt = database.prepare('SELECT * FROM proactive_state WHERE id = 1');
+  return (stmt.get() as ProactiveStateRow) ?? null;
+}
+
+export function initializeProactiveState(): void {
+  const database = getDatabase();
+  const existing = getProactiveState();
+  if (!existing) {
+    const stmt = database.prepare(`
+      INSERT OR IGNORE INTO proactive_state (id)
+      VALUES (1)
+    `);
+    stmt.run();
+    logger.info('Initialized proactive state');
+  }
+}
+
+export function updateProactiveState(
+  updates: Partial<Omit<ProactiveStateRow, 'id'>>
+): void {
+  const database = getDatabase();
+
+  // Build dynamic UPDATE statement
+  const fields: string[] = [];
+  const values: unknown[] = [];
+
+  for (const [key, value] of Object.entries(updates)) {
+    // Convert camelCase to snake_case
+    const snakeKey = key.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
+    fields.push(`${snakeKey} = ?`);
+    values.push(value);
+  }
+
+  if (fields.length === 0) return;
+
+  const sql = `UPDATE proactive_state SET ${fields.join(', ')} WHERE id = 1`;
+  const stmt = database.prepare(sql);
+  stmt.run(...values);
+  logger.debug('Updated proactive state', { fields: Object.keys(updates) });
+}
+
+export function recordSpontaneousMessage(
+  messageType: string,
+  content: string
+): void {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    INSERT INTO spontaneous_messages (message_type, content)
+    VALUES (?, ?)
+  `);
+  stmt.run(messageType, content);
+}
+
+export function countSpontaneousMessagesInLastHour(): number {
+  const database = getDatabase();
+  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+  const stmt = database.prepare(`
+    SELECT COUNT(*) as count FROM spontaneous_messages
+    WHERE sent_at >= ?
+  `);
+  const result = stmt.get(oneHourAgo.toISOString()) as { count: number };
+  return result.count;
+}
+
+export function countSpontaneousMessagesToday(timezone: string): number {
+  const database = getDatabase();
+
+  // Get midnight in user's timezone
+  const now = new Date();
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  const todayStr = formatter.format(now); // YYYY-MM-DD in user's timezone
+
+  // Convert to ISO for comparison (midnight local → UTC)
+  const midnightLocal = new Date(`${todayStr}T00:00:00`);
+
+  const stmt = database.prepare(`
+    SELECT COUNT(*) as count FROM spontaneous_messages
+    WHERE sent_at >= ?
+  `);
+  const result = stmt.get(midnightLocal.toISOString()) as { count: number };
+  return result.count;
+}
+
+export function getLastSpontaneousMessageTime(): Date | null {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    SELECT sent_at FROM spontaneous_messages
+    ORDER BY sent_at DESC
+    LIMIT 1
+  `);
+  const result = stmt.get() as { sent_at: string } | undefined;
+  return result ? new Date(result.sent_at) : null;
 }

@@ -1,3 +1,5 @@
+import * as readline from 'readline';
+
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
 interface LogEntry {
@@ -17,9 +19,35 @@ const LOG_COLORS: Record<LogLevel, string> = {
 
 const RESET = '\x1b[0m';
 
+/**
+ * Get log level from environment.
+ * Default: 'debug' (all logs)
+ */
+function getLogLevel(): LogLevel {
+  const envLevel = process.env.LOG_LEVEL?.toLowerCase();
+  if (envLevel === 'debug' || envLevel === 'info' || envLevel === 'warn' || envLevel === 'error') {
+    return envLevel;
+  }
+  return 'debug'; // Default: all logs
+}
+
+const GLOBAL_LOG_LEVEL = getLogLevel();
+
+/**
+ * Readline coordination for CLI-friendly logging.
+ * When readline is active, logs will pause input, print, then restore.
+ */
+let activeRl: readline.Interface | null = null;
+let activePrompt: string | null = null;
+
+export function setReadlineInterface(rl: readline.Interface | null, prompt: string | null): void {
+  activeRl = rl;
+  activePrompt = prompt;
+}
+
 class Logger {
   private context: string;
-  private minLevel: LogLevel = 'debug';
+  private minLevel: LogLevel = GLOBAL_LOG_LEVEL;
 
   constructor(context: string) {
     this.context = context;
@@ -62,12 +90,24 @@ class Logger {
 
     const formatted = this.formatEntry(entry);
 
+    // If readline is active, use clearLine and cursorTo to avoid messing up the prompt
+    if (activeRl && activePrompt) {
+      // Clear current line
+      readline.clearLine(process.stdout, 0);
+      readline.cursorTo(process.stdout, 0);
+    }
+
     if (level === 'error') {
       console.error(formatted);
     } else if (level === 'warn') {
       console.warn(formatted);
     } else {
       console.log(formatted);
+    }
+
+    // Restore prompt if readline is active
+    if (activeRl && activePrompt) {
+      activeRl.prompt(true);
     }
   }
 

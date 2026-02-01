@@ -10,6 +10,7 @@ import { searchTool } from './search.js';
 import { rememberTool } from './remember.js';
 import { readUrlTool } from './read-url.js';
 import { weatherTool } from './weather.js';
+import { reminderTools } from './reminders.js';
 
 export function initializeTools(): void {
   registerTool(timeTool);
@@ -17,6 +18,11 @@ export function initializeTools(): void {
   registerTool(rememberTool);
   registerTool(readUrlTool);
   registerTool(weatherTool);
+
+  // Register reminder tools (Fase 3)
+  for (const tool of reminderTools) {
+    registerTool(tool);
+  }
 }
 
 export {
