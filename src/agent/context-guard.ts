@@ -18,6 +18,7 @@ import {
 } from '../utils/tokens.js';
 import { scanMessagesForFacts, type ScanResult } from '../memory/fact-patterns.js';
 import { summarizeMessages } from '../memory/summarization-service.js';
+import { detectTopicShift, shouldTriggerSummarization } from '../memory/topic-detector.js';
 
 const logger = createLogger('context');
 
@@ -39,6 +40,8 @@ export interface ContextGuardResult {
   potentialFactsWarning?: string;
   /** Issue #3: Indicates if backup of truncated messages failed */
   backupFailed?: boolean;
+  /** Fase 2: Indicates if a topic shift was detected */
+  topicShiftDetected?: boolean;
 }
 
 /**
@@ -80,22 +83,51 @@ async function backupTruncatedMessages(
  * Trunca mensajes para que quepan en el context window.
  * Implementa Bug 12: detección y backup de facts potenciales.
  * Issue #3: Backup is now synchronous to prevent silent data loss.
+ * Fase 2: Detects topic shifts and triggers summarization accordingly.
+ *
+ * @param messages - Current message history
+ * @param maxTokens - Maximum context tokens
+ * @param currentUserMessage - Optional current user message for topic shift detection
  */
 export async function truncateMessages(
   messages: Message[],
-  maxTokens: number = DEFAULT_MAX_TOKENS
+  maxTokens: number = DEFAULT_MAX_TOKENS,
+  currentUserMessage?: string
 ): Promise<ContextGuardResult> {
   const availableTokens = maxTokens - SYSTEM_PROMPT_RESERVE - RESPONSE_RESERVE;
 
   const totalTokens = estimateTotalTokens(messages);
 
+  // Fase 2: Detect topic shift BEFORE any truncation decision
+  let topicShiftDetected = false;
+  if (currentUserMessage && messages.length > 0) {
+    const topicShiftResult = detectTopicShift(currentUserMessage, messages);
+    if (topicShiftResult.shifted) {
+      topicShiftDetected = true;
+      logger.info('Topic shift detected', {
+        reason: topicShiftResult.reason,
+        previousDomain: topicShiftResult.previousDomain,
+        newDomain: topicShiftResult.newDomain,
+      });
+    }
+  }
+
   if (totalTokens <= availableTokens) {
+    // Even if not truncating, topic shift may trigger summarization
+    if (topicShiftDetected && shouldTriggerSummarization({ shifted: true })) {
+      logger.info('Topic shift detected without truncation, summarizing current context');
+      summarizeMessages(messages).catch(err => {
+        logger.warn('Topic shift summarization failed', { error: err instanceof Error ? err.message : err });
+      });
+    }
+
     return {
       messages,
       truncated: false,
       originalCount: messages.length,
       finalCount: messages.length,
       estimatedTokens: totalTokens,
+      topicShiftDetected,
     };
   }
 
@@ -165,9 +197,17 @@ export async function truncateMessages(
       }
     }
 
-    // Fase 2: Trigger summarization for removed messages (fire-and-forget)
-    if (removedMessages.length >= 2) {
-      summarizeMessages(removedMessages).catch(err => {
+    // Fase 2: Determine what to summarize based on topic shift
+    // If topic shift detected, summarize the full previous context (not just removed messages)
+    // This ensures we capture the complete topic before the shift
+    const messagesToSummarize = topicShiftDetected ? messages : removedMessages;
+
+    if (messagesToSummarize.length >= 2) {
+      logger.debug('Triggering summarization', {
+        scope: topicShiftDetected ? 'full_context' : 'removed_messages',
+        messageCount: messagesToSummarize.length,
+      });
+      summarizeMessages(messagesToSummarize).catch(err => {
         logger.warn('Summarization failed', { error: err instanceof Error ? err.message : err });
       });
     }
@@ -181,6 +221,7 @@ export async function truncateMessages(
     estimatedTokens: currentTokens,
     potentialFactsWarning,
     backupFailed,
+    topicShiftDetected,
   };
 }
 

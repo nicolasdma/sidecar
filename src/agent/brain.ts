@@ -106,10 +106,19 @@ export class Brain {
     let history = loadHistory();
 
     // Issue #3: truncateMessages is now async to ensure backup completes
-    const { messages: truncatedHistory, backupFailed } = await truncateMessages(history, this.maxContextTokens);
+    // Fase 2: Pass current user message for topic shift detection
+    const { messages: truncatedHistory, backupFailed, topicShiftDetected } = await truncateMessages(
+      history,
+      this.maxContextTokens,
+      options.userInput // Pass for topic shift detection
+    );
 
     if (backupFailed) {
       logger.warn('Backup of truncated messages failed - potential data loss');
+    }
+
+    if (topicShiftDetected) {
+      logger.debug('Topic shift detected, context summarized');
     }
 
     const systemPrompt = await buildSystemPrompt();

@@ -35,6 +35,7 @@ import {
 } from './facts-store.js';
 import { ensureMigration } from './facts-migration.js';
 import { formatSummariesForPrompt } from './summarization-service.js';
+import { getDecayStatus } from './decay-service.js';
 
 const log = createLogger('knowledge');
 
@@ -171,8 +172,42 @@ export async function loadKnowledgeLegacy(): Promise<string> {
 }
 
 /**
+ * Filters facts based on decay status.
+ * Health facts are always included (critical information).
+ * Other facts are filtered based on their decay stage and query relevance.
+ *
+ * @param facts - Facts to filter
+ * @param queryRelevance - Optional relevance score from keyword matching (0.0-1.0)
+ */
+function filterByDecay(facts: StoredFact[], queryRelevance?: number): StoredFact[] {
+  return facts.filter(fact => {
+    // Health facts are critical - always include (but respect stale flag)
+    if (fact.domain === 'health') {
+      return !fact.stale;
+    }
+
+    // Compute decay status at runtime
+    const decay = getDecayStatus(fact.lastConfirmedAt);
+
+    // If fact shouldn't be injected at all, filter it out
+    if (!decay.inject) {
+      return false;
+    }
+
+    // If we have a relevance score, check against threshold
+    if (queryRelevance !== undefined) {
+      return queryRelevance >= decay.relevanceThreshold;
+    }
+
+    // No query - only include fresh and aging facts (not low_priority)
+    return decay.stage === 'fresh' || decay.stage === 'aging';
+  });
+}
+
+/**
  * Formats SQLite-based facts for the prompt.
  * Always includes health facts, then adds relevant facts based on query.
+ * Fase 2: Uses getDecayStatus for proper decay-based filtering.
  *
  * @param userQuery - Optional query for keyword-based filtering
  * @param maxTokens - Token budget for facts section
@@ -181,25 +216,31 @@ export function formatFactsForPrompt(
   userQuery?: string,
   maxTokens: number = TOKEN_BUDGETS.MAX_LEARNINGS_TOKENS
 ): string {
-  // Always get health facts
-  const healthFacts = getHealthFacts();
+  // Always get health facts (filtered by decay)
+  const allHealthFacts = getHealthFacts();
+  const healthFacts = filterByDecay(allHealthFacts);
 
   // Get relevant facts based on query, or recent facts if no query
   let relevantFacts: StoredFact[];
   if (userQuery && userQuery.trim()) {
-    relevantFacts = filterFactsByKeywords(userQuery, 20);
-    // Filter out health facts from relevant (we already have them)
-    relevantFacts = relevantFacts.filter(f => f.domain !== 'health');
+    // filterFactsByKeywords already respects low priority, but we apply decay filtering too
+    const rawRelevant = filterFactsByKeywords(userQuery, 30); // Get more, then filter
+    // Filter out health facts (already have them) and apply decay
+    const nonHealth = rawRelevant.filter(f => f.domain !== 'health');
+    // For keyword matches, we assume high relevance (they matched the query)
+    relevantFacts = filterByDecay(nonHealth, 0.8);
   } else {
     // No query - get most recent non-health facts
-    relevantFacts = getFacts({ limit: 20 }).filter(f => f.domain !== 'health');
+    const rawFacts = getFacts({ limit: 30 }).filter(f => f.domain !== 'health');
+    // No query means no specific relevance - stricter decay filtering
+    relevantFacts = filterByDecay(rawFacts);
   }
 
   if (healthFacts.length === 0 && relevantFacts.length === 0) {
     return '';
   }
 
-  // Format health facts (never truncate)
+  // Format health facts (never truncate health)
   const healthLines = healthFacts.map(f => `- ${f.fact}`);
   let currentTokens = estimateTokens(healthLines.join('\n'));
 
@@ -207,7 +248,7 @@ export function formatFactsForPrompt(
   const includedRelevant: string[] = [];
   let truncatedCount = 0;
 
-  for (const fact of relevantFacts) {
+  for (const fact of relevantFacts.slice(0, 20)) { // Limit to 20 after filtering
     const line = `- ${fact.fact}`;
     const lineTokens = estimateTokens(line);
 

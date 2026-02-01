@@ -24,6 +24,10 @@ import {
   markExtractionFailed,
   getPendingExtractionCount,
   cleanupOldExtractions,
+  recoverStalledExtractions,
+  enforceQueueSizeLimit,
+  retryFailedExtractions,
+  purgeExtractionQueue,
   type PendingExtractionRow,
 } from './store.js';
 import { saveFact, type NewFact } from './facts-store.js';
@@ -37,10 +41,14 @@ const logger = createLogger('extraction');
 const WORKER_INTERVAL_MS = 5_000; // 5 seconds
 const BATCH_SIZE = 5; // Process up to 5 items per tick
 const BACKOFF_DELAYS = [0, 5_000, 30_000]; // Retry delays in ms
+const MAX_QUEUE_SIZE = 1000; // Maximum pending items before dropping oldest
+const OLLAMA_RECHECK_INTERVAL_MS = 60_000; // Re-check Ollama every 60 seconds
 
 // Worker state
 let workerTimer: ReturnType<typeof setInterval> | null = null;
 let isProcessing = false;
+let ollamaAvailable = false;
+let lastOllamaCheck = 0;
 
 // Extraction prompt (English for token efficiency)
 const EXTRACTION_PROMPT = `Extract facts about the user from this message.
@@ -78,7 +86,8 @@ interface ExtractedFact {
 }
 
 // Minimum fact length to avoid garbage extractions
-const MIN_FACT_LENGTH = 10;
+// Lowered from 10 to 5 because Spanish facts can be short (e.g., "Es vegano")
+const MIN_FACT_LENGTH = 5;
 
 /**
  * Validates and normalizes an extracted fact.
@@ -187,6 +196,29 @@ async function processExtractionItem(item: PendingExtractionRow): Promise<boolea
 }
 
 /**
+ * Checks Ollama availability with caching to avoid excessive checks.
+ */
+async function checkOllamaWithCache(): Promise<boolean> {
+  const now = Date.now();
+  if (now - lastOllamaCheck < OLLAMA_RECHECK_INTERVAL_MS && lastOllamaCheck > 0) {
+    return ollamaAvailable;
+  }
+
+  const availability = await checkOllamaAvailability();
+  ollamaAvailable = availability.available;
+  lastOllamaCheck = now;
+
+  if (!ollamaAvailable) {
+    logger.debug('Ollama not available, will retry later', { error: availability.error });
+  } else if (lastOllamaCheck > 0) {
+    // Only log recovery if we've checked before
+    logger.info('Ollama became available');
+  }
+
+  return ollamaAvailable;
+}
+
+/**
  * Processes the extraction queue.
  * Called by the worker timer.
  */
@@ -199,6 +231,15 @@ async function processExtractionQueue(): Promise<void> {
   isProcessing = true;
 
   try {
+    // Periodically check Ollama availability (may have become available after startup)
+    const isOllamaUp = await checkOllamaWithCache();
+    if (!isOllamaUp) {
+      return;
+    }
+
+    // Enforce queue size limit to prevent unbounded growth
+    enforceQueueSizeLimit(MAX_QUEUE_SIZE);
+
     const items = getPendingExtractions(BATCH_SIZE);
 
     if (items.length === 0) {
@@ -309,6 +350,10 @@ function containsPersonalIndicators(content: string): boolean {
 /**
  * Starts the background extraction worker.
  * Safe to call multiple times - will only start one worker.
+ *
+ * The worker starts regardless of Ollama availability and will
+ * periodically re-check, allowing extraction to work after Ollama
+ * becomes available.
  */
 export async function startExtractionWorker(): Promise<void> {
   if (workerTimer) {
@@ -316,30 +361,38 @@ export async function startExtractionWorker(): Promise<void> {
     return;
   }
 
-  // Check Ollama availability
-  const availability = await checkOllamaAvailability();
-  if (!availability.available) {
-    logger.warn('Ollama not available, extraction worker disabled', {
-      error: availability.error,
-    });
-    return;
+  // Recover stalled extractions from previous crash
+  const recovered = recoverStalledExtractions();
+  if (recovered > 0) {
+    logger.info('Recovered stalled extractions from previous crash', { count: recovered });
   }
-
-  logger.info('Starting extraction worker', { model: availability.model });
 
   // Cleanup old extractions on startup
   cleanupOldExtractions();
 
-  // Start the worker
+  // Initial Ollama availability check (non-blocking - worker will retry)
+  const availability = await checkOllamaAvailability();
+  ollamaAvailable = availability.available;
+  lastOllamaCheck = Date.now();
+
+  if (availability.available) {
+    logger.info('Starting extraction worker', { model: availability.model });
+  } else {
+    logger.warn('Starting extraction worker (Ollama not yet available, will retry)', {
+      error: availability.error,
+    });
+  }
+
+  // Start the worker - it will periodically re-check Ollama
   workerTimer = setInterval(() => {
     processExtractionQueue().catch(error => {
       logger.error('Worker tick failed', { error });
     });
   }, WORKER_INTERVAL_MS);
 
-  // Also run immediately if there are pending items
+  // Also run immediately if there are pending items and Ollama is available
   const pendingCount = getPendingExtractionCount();
-  if (pendingCount > 0) {
+  if (pendingCount > 0 && ollamaAvailable) {
     logger.info('Processing existing queue', { pending: pendingCount });
     processExtractionQueue().catch(error => {
       logger.error('Initial queue processing failed', { error });
@@ -365,9 +418,32 @@ export function stopExtractionWorker(): void {
 export function getExtractionStatus(): {
   running: boolean;
   pending: number;
+  ollamaAvailable: boolean;
 } {
   return {
     running: workerTimer !== null,
     pending: getPendingExtractionCount(),
+    ollamaAvailable,
   };
+}
+
+/**
+ * Manually retries failed extractions.
+ * Useful after fixing extraction logic or Ollama issues.
+ *
+ * @param maxRetries - Maximum attempts before leaving as failed (default: 5)
+ * @returns Number of items reset for retry
+ */
+export function retryFailed(maxRetries: number = 5): number {
+  return retryFailedExtractions(maxRetries);
+}
+
+/**
+ * Purges the entire extraction queue.
+ * Use with caution - removes all pending, processing, and failed items.
+ *
+ * @returns Number of items purged
+ */
+export function purgeQueue(): number {
+  return purgeExtractionQueue();
 }

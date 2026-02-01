@@ -756,6 +756,112 @@ export function cleanupOldExtractions(): number {
   return result.changes;
 }
 
+/**
+ * Recovers stalled extractions (stuck in 'processing' status).
+ * Called at startup to reset items that were being processed when the app crashed.
+ * Items stuck in 'processing' status would never be retried otherwise.
+ */
+export function recoverStalledExtractions(): number {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    UPDATE pending_extraction
+    SET status = 'pending',
+        attempts = attempts + 1,
+        error = 'Recovered from stalled processing state'
+    WHERE status = 'processing'
+  `);
+  const result = stmt.run();
+  if (result.changes > 0) {
+    logger.warn('Recovered stalled extractions', { count: result.changes });
+  }
+  return result.changes;
+}
+
+/**
+ * Enforces max queue size by removing oldest pending items.
+ * Called when queue exceeds MAX_QUEUE_SIZE to prevent unbounded growth.
+ *
+ * @param maxSize - Maximum number of pending items to keep (default: 1000)
+ * @returns Number of items removed
+ */
+export function enforceQueueSizeLimit(maxSize: number = 1000): number {
+  const database = getDatabase();
+
+  // Count current pending items
+  const countStmt = database.prepare(`
+    SELECT COUNT(*) as count FROM pending_extraction
+    WHERE status = 'pending'
+  `);
+  const { count } = countStmt.get() as { count: number };
+
+  if (count <= maxSize) {
+    return 0;
+  }
+
+  // Remove oldest pending items to get below limit
+  const toRemove = count - maxSize;
+  const deleteStmt = database.prepare(`
+    DELETE FROM pending_extraction
+    WHERE id IN (
+      SELECT id FROM pending_extraction
+      WHERE status = 'pending'
+      ORDER BY created_at ASC
+      LIMIT ?
+    )
+  `);
+
+  const result = deleteStmt.run(toRemove);
+  if (result.changes > 0) {
+    logger.warn('Enforced queue size limit - dropped oldest items', {
+      removed: result.changes,
+      maxSize,
+    });
+  }
+  return result.changes;
+}
+
+/**
+ * Retries failed extractions by resetting their status to pending.
+ * Useful for manual recovery when extraction logic has been fixed.
+ *
+ * @param maxRetries - Maximum attempts before leaving as failed (default: 5)
+ * @returns Number of items reset for retry
+ */
+export function retryFailedExtractions(maxRetries: number = 5): number {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    UPDATE pending_extraction
+    SET status = 'pending',
+        error = NULL
+    WHERE status = 'failed'
+      AND attempts < ?
+  `);
+  const result = stmt.run(maxRetries);
+  if (result.changes > 0) {
+    logger.info('Reset failed extractions for retry', { count: result.changes });
+  }
+  return result.changes;
+}
+
+/**
+ * Purges the entire extraction queue.
+ * Use with caution - removes all pending, processing, and failed items.
+ *
+ * @returns Number of items purged
+ */
+export function purgeExtractionQueue(): number {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    DELETE FROM pending_extraction
+    WHERE status IN ('pending', 'processing', 'failed')
+  `);
+  const result = stmt.run();
+  if (result.changes > 0) {
+    logger.warn('Purged extraction queue', { count: result.changes });
+  }
+  return result.changes;
+}
+
 // ============= Fase 2: Summary Functions =============
 
 export interface SummaryData {
@@ -769,60 +875,64 @@ export interface SummaryData {
 }
 
 /**
- * Gets the next available slot (1-4), evicting oldest if full.
- * Returns the slot number and whether eviction occurred.
- */
-function getNextSummarySlot(database: Database.Database): { slot: number; evicted: boolean } {
-  // Find first empty slot
-  const emptySlot = database.prepare(`
-    SELECT s.slot FROM (SELECT 1 as slot UNION SELECT 2 UNION SELECT 3 UNION SELECT 4) s
-    LEFT JOIN summaries ON s.slot = summaries.slot
-    WHERE summaries.id IS NULL
-    ORDER BY s.slot
-    LIMIT 1
-  `).get() as { slot: number } | undefined;
-
-  if (emptySlot) {
-    return { slot: emptySlot.slot, evicted: false };
-  }
-
-  // All slots full - evict slot 1 and shift others
-  database.exec(`
-    DELETE FROM summaries WHERE slot = 1;
-    UPDATE summaries SET slot = slot - 1 WHERE slot > 1;
-  `);
-
-  return { slot: 4, evicted: true };
-}
-
-/**
  * Saves a new summary to the next available slot.
  * Implements FIFO eviction when all 4 slots are full.
+ *
+ * IMPORTANT: The entire operation (slot selection + insert) is wrapped in
+ * a transaction to prevent race conditions when two summaries are saved
+ * concurrently.
  */
 export function saveSummary(data: SummaryData): number {
   const database = getDatabase();
 
-  const { slot, evicted } = getNextSummarySlot(database);
+  // Wrap slot selection and insertion in a single transaction
+  // to prevent concurrent writes from getting the same slot
+  const saveWithSlotAllocation = database.transaction(() => {
+    // Find first empty slot (inline to keep transaction short)
+    const emptySlot = database.prepare(`
+      SELECT s.slot FROM (SELECT 1 as slot UNION SELECT 2 UNION SELECT 3 UNION SELECT 4) s
+      LEFT JOIN summaries ON s.slot = summaries.slot
+      WHERE summaries.id IS NULL
+      ORDER BY s.slot
+      LIMIT 1
+    `).get() as { slot: number } | undefined;
+
+    let slot: number;
+    let evicted = false;
+
+    if (emptySlot) {
+      slot = emptySlot.slot;
+    } else {
+      // All slots full - evict slot 1 and shift others
+      database.prepare('DELETE FROM summaries WHERE slot = 1').run();
+      database.prepare('UPDATE summaries SET slot = slot - 1 WHERE slot > 1').run();
+      slot = 4;
+      evicted = true;
+    }
+
+    // Insert the new summary
+    database.prepare(`
+      INSERT OR REPLACE INTO summaries (slot, topic, discussed, outcome, decisions, open_questions, turn_start, turn_end)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      slot,
+      data.topic,
+      JSON.stringify(data.discussed),
+      data.outcome ?? null,
+      data.decisions ? JSON.stringify(data.decisions) : null,
+      data.openQuestions ? JSON.stringify(data.openQuestions) : null,
+      data.turnStart,
+      data.turnEnd
+    );
+
+    return { slot, evicted };
+  });
+
+  const { slot, evicted } = saveWithSlotAllocation();
+
   if (evicted) {
     logger.info('Evicted oldest summary for new one');
   }
-
-  const stmt = database.prepare(`
-    INSERT OR REPLACE INTO summaries (slot, topic, discussed, outcome, decisions, open_questions, turn_start, turn_end)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  stmt.run(
-    slot,
-    data.topic,
-    JSON.stringify(data.discussed),
-    data.outcome ?? null,
-    data.decisions ? JSON.stringify(data.decisions) : null,
-    data.openQuestions ? JSON.stringify(data.openQuestions) : null,
-    data.turnStart,
-    data.turnEnd
-  );
-
   logger.info('Saved summary', { slot, topic: data.topic });
   return slot;
 }
@@ -884,6 +994,7 @@ export function updateFactPriority(id: string, priority: FactPriority): void {
 
 /**
  * Gets facts that need decay check (not stale, not archived).
+ * @deprecated Use getFactsForDecayCheckPaginated for large datasets
  */
 export function getFactsForDecayCheck(): FactRow[] {
   const database = getDatabase();
@@ -893,6 +1004,63 @@ export function getFactsForDecayCheck(): FactRow[] {
     ORDER BY last_confirmed_at ASC
   `);
   return stmt.all() as FactRow[];
+}
+
+/**
+ * Gets facts for decay check with pagination.
+ * Use this for large datasets to avoid blocking the event loop.
+ *
+ * @param limit - Maximum facts to return (default: 100)
+ * @param offset - Number of facts to skip (default: 0)
+ * @returns Array of facts for decay check
+ */
+export function getFactsForDecayCheckPaginated(limit: number = 100, offset: number = 0): FactRow[] {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    SELECT * FROM facts
+    WHERE stale = 0 AND archived = 0
+    ORDER BY last_confirmed_at ASC
+    LIMIT ? OFFSET ?
+  `);
+  return stmt.all(limit, offset) as FactRow[];
+}
+
+/**
+ * Gets total count of facts that need decay check.
+ */
+export function getFactsForDecayCount(): number {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    SELECT COUNT(*) as count FROM facts
+    WHERE stale = 0 AND archived = 0
+  `);
+  const result = stmt.get() as { count: number };
+  return result.count;
+}
+
+/**
+ * Gets decay statistics using SQL aggregation.
+ * More efficient than loading all facts into memory.
+ */
+export function getDecayStatsFromDb(): {
+  aging: number;
+  lowPriority: number;
+  stale: number;
+} {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    SELECT
+      SUM(CASE WHEN aging = 1 AND stale = 0 AND archived = 0 THEN 1 ELSE 0 END) as aging,
+      SUM(CASE WHEN priority = 'low' AND stale = 0 AND archived = 0 THEN 1 ELSE 0 END) as lowPriority,
+      SUM(CASE WHEN stale = 1 AND archived = 0 THEN 1 ELSE 0 END) as stale
+    FROM facts
+  `);
+  const result = stmt.get() as { aging: number | null; lowPriority: number | null; stale: number | null };
+  return {
+    aging: result.aging ?? 0,
+    lowPriority: result.lowPriority ?? 0,
+    stale: result.stale ?? 0,
+  };
 }
 
 /**
