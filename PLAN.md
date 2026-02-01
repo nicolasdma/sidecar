@@ -1,7 +1,7 @@
 # Plan: AI Agent Companion (Nuevo Proyecto)
 
-> Estado: ✅ FASE 2 COMPLETADA | ⏳ FASE 3 EN PROGRESO | 📋 FASE 3.v2 DISEÑADA | 📐 FASE 4 DISEÑO COMPLETO
-> Última actualización: 2026-01-31 (actualización 14)
+> Estado: ✅ FASE 2 COMPLETADA | 📋 FASE 3 LISTA PARA IMPLEMENTAR | 📐 FASE 4 DISEÑO COMPLETO
+> Última actualización: 2026-01-31 (actualización 15)
 
 ---
 
@@ -2609,12 +2609,73 @@ data/
   - Carga fresh de lastUserMessageAt
   - Incluye top 5 facts relevantes
 
-#### 3.9 Implementación: Notification Sink
+#### 3.9 Implementación: Channel Layer (Multi-Canal Ready)
 
-- [ ] `src/interfaces/notification-sink.ts`
-  - Interface `NotificationSink`
-  - `CLINotificationSink` (print con prefijo emoji)
-  - Placeholder para `WhatsAppNotificationSink` (Fase 4)
+> **Nota:** Implementamos las abstracciones de canal desde Fase 3 para que Fase 4 (WhatsApp) sea plug-and-play.
+> Ver sección "Abstracciones de Canal" para las interfaces completas.
+
+- [ ] `src/interfaces/types.ts`
+  - `ChannelType = 'cli' | 'whatsapp' | 'telegram' | 'desktop'`
+  - `IncomingMessage` interface
+  - `NotificationMetadata` interface
+
+- [ ] `src/interfaces/message-router.ts`
+  ```typescript
+  class MessageRouter {
+    private sources: Map<ChannelType, MessageSource> = new Map();
+    private sinks: Map<ChannelType, NotificationSink> = new Map();
+
+    registerSource(source: MessageSource): void;
+    registerSink(sink: NotificationSink): void;
+
+    async handleIncoming(msg: IncomingMessage): Promise<void>;
+    async sendNotification(userId: string, message: string, metadata: NotificationMetadata): Promise<boolean>;
+    private async handleCommand(msg: IncomingMessage): Promise<boolean>;
+  }
+  ```
+  - Entry point para TODOS los mensajes entrantes
+  - Routing de notificaciones proactivas
+  - Intercepta comandos (`/quiet`, `/reminders`, etc.)
+  - En Fase 3: solo CLI, routing trivial. En Fase 4: agrega WhatsApp.
+
+- [ ] `src/interfaces/cli-source.ts`
+  ```typescript
+  class CLIMessageSource implements MessageSource {
+    readonly channel: ChannelType = 'cli';
+    onMessage(handler): void;
+    sendResponse(userId, content): Promise<void>;
+    async emitMessage(content: string): Promise<void>;  // Llamado desde readline
+  }
+  ```
+
+- [ ] `src/interfaces/cli-sink.ts`
+  - `CLINotificationSink` implements `NotificationSink`
+  - Print con prefijo emoji (🔔 para reminders, 💬 para espontáneos)
+
+- [ ] Refactorizar `src/interfaces/cli.ts`:
+  - Usar `CLIMessageSource` + `MessageRouter`
+  - **Eliminar** llamada directa a `brain.think()`
+  - readline loop → `cliSource.emitMessage(input)`
+
+- [ ] Actualizar proactive loops para usar router:
+  - `reminder-scheduler.ts`: usar `router.sendNotification()`
+  - `spontaneous-loop.ts`: usar `router.sendNotification()`
+
+##### Política de Estado Multi-Canal
+
+| Estado | Scope | Justificación |
+|--------|-------|---------------|
+| `lastUserMessageAt` | **GLOBAL** | Usuario activo en cualquier canal = activo |
+| `spontaneousCountToday` | **GLOBAL** | Límite diario es por usuario |
+| `lastActiveChannel` | **GLOBAL** | Para routing en Fase 4 |
+
+##### Reglas de Routing (triviales en Fase 3, preparadas para Fase 4)
+
+| Tipo de Mensaje | Fase 3 (CLI only) | Fase 4+ (Multi-canal) |
+|-----------------|-------------------|----------------------|
+| **Respuesta** | CLI | Mismo canal que el mensaje |
+| **Reminder** | CLI | Primary + todos con preference != 'none' |
+| **Espontáneo** | CLI | Solo Primary (si preference = 'all') |
 
 #### 3.10 Implementación: Comandos de Control
 
@@ -2635,8 +2696,14 @@ data/
   - Proactivity level: medium
   - Quiet hours: 22:00 - 08:00
   - Timezone: America/Argentina/Buenos_Aires
+
+  ## Channel Preferences
+  - Primary channel: cli
+  - CLI notifications: all
+  - WhatsApp notifications: all
   ```
 - [ ] Parser de configuración en `src/agent/proactive/types.ts`
+- [ ] Parser de Channel Preferences en `src/interfaces/types.ts`
 - [ ] Defaults conservadores si no hay config
 
 ---
@@ -2728,10 +2795,16 @@ Día 2: Tools de Reminders
 │   └── Verificar: find_reminder → cancel_reminder funciona
 └── Tests de errores de parsing con sugerencias
 
-Día 3: Reminder Scheduler
+Día 3: Channel Layer + Reminder Scheduler
+├── Implementar src/interfaces/types.ts (ChannelType, IncomingMessage, etc.)
+├── Implementar src/interfaces/message-router.ts
+├── Implementar src/interfaces/cli-source.ts (CLIMessageSource)
+├── Implementar src/interfaces/cli-sink.ts (CLINotificationSink)
+├── Refactorizar src/interfaces/cli.ts para usar MessageRouter
+│   └── Eliminar llamada directa a brain.think()
 ├── Implementar src/agent/proactive/reminder-scheduler.ts
+│   └── Usar router.sendNotification() (NO sink directo)
 ├── Integrar con node-cron (cada 60 segundos)
-├── Implementar CLINotificationSink
 ├── Mitigación P2: Estado 3-niveles (0 → 1 → 2)
 ├── Mitigación P12: Columna delivered_at + checkLostReminders() al startup
 ├── Implementar setPendingWarning() para notificar pérdidas al usuario
@@ -2756,8 +2829,9 @@ Día 4: Spontaneous Loop
 │   ├── Mitigación P14: Validar messageType antes de enviar
 │   ├── Mitigación P15: Re-check freshness post-LLM
 │   ├── Mitigación P16: try/finally para liberar mutex
-│   ├── Mark before send: Actualizar state ANTES de notificationSink.send()
+│   ├── Mark before send: Actualizar state ANTES de router.sendNotification()
 │   └── NO implementar post-check P6 naive (ver decisión)
+├── Usar router.sendNotification() (NO sink directo)
 └── Tests con /proactive tick
 
 Día 5: Comandos y Polish
@@ -2766,9 +2840,8 @@ Día 5: Comandos y Polish
 ├── Implementar /reminders lost (P12 recovery)
 ├── Implementar /proactive (debug: status, tick, context, decide, reset)
 ├── Actualizar user.md template con:
-│   ├── Proactivity level: medium
-│   ├── Quiet hours: 22:00 - 08:00
-│   └── Timezone: America/Argentina/Buenos_Aires (IANA obligatorio)
+│   ├── Communication Preferences (Proactivity, Quiet hours, Timezone)
+│   └── Channel Preferences (Primary channel, per-channel notifications)
 ├── Logging completo:
 │   ├── Cada tick con reason de skip/proceed
 │   ├── reminder_attempting + reminder_delivered separados (P12)
@@ -2799,190 +2872,6 @@ Día 5: Comandos y Polish
 
 ---
 
-### FASE 3.v2: Preparación Multi-Canal
-**Objetivo:** Adaptar Fase 3 existente para soportar múltiples canales ANTES de implementar WhatsApp.
-
-> ⚠️ **IMPORTANTE:** Fase 3 ya está implementada. Esta sección documenta cambios ADICIONALES que deben hacerse para preparar la arquitectura multi-canal.
-
----
-
-#### Contexto
-
-La implementación actual de Fase 3:
-- CLI llama directamente a `brain.think()`
-- Proactive loops envían directamente a CLINotificationSink
-- No hay abstracción de routing
-
-**Problema:** Si agregamos WhatsApp sin refactorizar, tendríamos lógica duplicada y decisiones de routing ad-hoc.
-
-**Solución:** Introducir `MessageRouter` ANTES de Fase 4, validando el pattern con CLI solo.
-
----
-
-#### 3v2.1 Implementar MessageRouter
-
-> **Ver sección "Abstracciones de Canal"** para las interfaces completas.
-
-- [ ] `src/interfaces/message-router.ts`
-  ```typescript
-  class MessageRouter {
-    private sources: Map<ChannelType, MessageSource> = new Map();
-    private sinks: Map<ChannelType, NotificationSink> = new Map();
-
-    registerSource(source: MessageSource): void;
-    registerSink(sink: NotificationSink): void;
-
-    // Entry point para mensajes entrantes
-    async handleIncoming(msg: IncomingMessage): Promise<void>;
-
-    // Entry point para notificaciones proactivas
-    async sendNotification(
-      userId: string,
-      message: string,
-      metadata: NotificationMetadata
-    ): Promise<boolean>;
-
-    // Intercepta y procesa comandos
-    private async handleCommand(msg: IncomingMessage): Promise<boolean>;
-  }
-  ```
-
-- [ ] Lógica de routing inicial (solo CLI):
-  - `handleIncoming()` → llama a `brain.think()` y envía respuesta por mismo canal
-  - `sendNotification()` → envía a CLISink directamente (un solo sink)
-  - `handleCommand()` → procesa `/quiet`, `/reminders`, etc.
-
----
-
-#### 3v2.2 Refactorizar CLI para usar MessageRouter
-
-- [ ] Crear `src/interfaces/cli-source.ts`
-  ```typescript
-  class CLIMessageSource implements MessageSource {
-    readonly channel: ChannelType = 'cli';
-    private handler: ((msg: IncomingMessage) => Promise<void>) | null = null;
-
-    onMessage(handler: (msg: IncomingMessage) => Promise<void>): void {
-      this.handler = handler;
-    }
-
-    async sendResponse(userId: string, content: string): Promise<void> {
-      console.log(`\n\x1b[33mSidecar:\x1b[0m ${content}\n`);
-    }
-
-    // Llamado desde readline loop
-    async emitMessage(content: string): Promise<void> {
-      if (this.handler) {
-        await this.handler({
-          id: crypto.randomUUID(),
-          source: 'cli',
-          userId: 'local',
-          content,
-          timestamp: new Date(),
-          metadata: {}
-        });
-      }
-    }
-  }
-  ```
-
-- [ ] Modificar `src/interfaces/cli.ts`:
-  - Crear instancia de `CLIMessageSource`
-  - En readline loop: llamar `cliSource.emitMessage(input)` en lugar de `brain.think()`
-  - Remover llamada directa a `think()`
-
----
-
-#### 3v2.3 Refactorizar Proactive Loops
-
-- [ ] Modificar `src/agent/proactive/reminder-scheduler.ts`:
-  - Inyectar `MessageRouter` en constructor
-  - Cambiar: `notificationSink.send()` → `router.sendNotification()`
-
-- [ ] Modificar `src/agent/proactive/spontaneous-loop.ts`:
-  - Inyectar `MessageRouter` en constructor
-  - Cambiar: `notificationSink.send()` → `router.sendNotification()`
-
----
-
-#### 3v2.4 Política de Routing (Documentación)
-
-> Esta política aplica en Fase 4+. En Fase 3.v2, con un solo canal, es trivial.
-
-##### Estado Proactivo: GLOBAL
-
-| Estado | Scope | Justificación |
-|--------|-------|---------------|
-| `lastUserMessageAt` | **GLOBAL** | Si el usuario habla en cualquier canal, está activo |
-| `spontaneousCountToday` | **GLOBAL** | Límite diario es por usuario, no por canal |
-| `lastSpontaneousMessageAt` | **GLOBAL** | Cooldown aplica sin importar el canal |
-| `lastGreetingType` | **GLOBAL** | No saludar dos veces aunque cambie de canal |
-| `circuitBreakerTrippedUntil` | **GLOBAL** | Silencio aplica a todos los canales |
-
-**Decisión:** El estado proactivo es GLOBAL porque representa el comportamiento del agente hacia UN usuario.
-
-##### Reglas de Routing (para Fase 4+)
-
-| Tipo de Mensaje | Canal(es) Destino | Si Primary No Disponible |
-|-----------------|-------------------|--------------------------|
-| **Reminder** | Primary + todos con `all` o `reminders-only` | Enviar a todos disponibles |
-| **Espontáneo** | Solo Primary (si preference = `all`) | NO enviar (skip) |
-
-##### Campo `lastActiveChannel`
-
-Agregar a `ProactiveState`:
-```typescript
-interface ProactiveState {
-  // ... campos existentes ...
-  lastActiveChannel: ChannelType | null;  // NUEVO
-}
-```
-
-Actualizar en `MessageRouter.handleIncoming()`.
-
----
-
-#### 3v2.5 Actualizar user.md
-
-- [ ] Ya completado (ver archivo actualizado con Channel Preferences)
-
----
-
-#### Criterios de Verificación FASE 3.v2
-
-| Test | Descripción | Estado |
-|------|-------------|--------|
-| CLI funciona igual | Chatear, comandos, todo igual que antes | [ ] |
-| Proactive por router | Mensajes espontáneos llegan por CLI | [ ] |
-| Reminders por router | Reminders llegan por CLI | [ ] |
-| `/quiet` funciona | Silencia via MessageRouter | [ ] |
-| Logs muestran routing | "Routing to cli" en logs | [ ] |
-
-**Invariante:** Comportamiento 100% idéntico al usuario. Los cambios son internos.
-
----
-
-#### Orden de Implementación
-
-```
-Día 1: MessageRouter + CLI refactor
-├── Crear MessageRouter con lógica básica
-├── Crear CLIMessageSource
-├── Modificar cli.ts para usar router
-├── Tests: CLI funciona igual
-└── Commit: "[Fase 3.v2] MessageRouter + CLI refactor"
-
-Día 2: Proactive loops + Polish
-├── Modificar reminder-scheduler para usar router
-├── Modificar spontaneous-loop para usar router
-├── Agregar lastActiveChannel a ProactiveState
-├── Tests: proactividad funciona igual
-├── Verificar TODOS los criterios
-└── Commit: "[Fase 3.v2] Proactive loops via MessageRouter"
-```
-
----
-
 ### FASE 4: WhatsApp Bridge
 **Objetivo:** Acceso desde el celular, primer canal externo, validación de arquitectura multi-canal.
 
@@ -2990,17 +2879,17 @@ Día 2: Proactive loops + Polish
 
 #### Pre-requisitos de Fase 4
 
-> ⚠️ **Dependencia:** Fase 3.v2 debe estar completada antes de iniciar Fase 4.
+> ⚠️ **Dependencia:** Fase 3 debe estar completada antes de iniciar Fase 4.
 
 | Requisito | Implementado en | Bloqueante |
 |-----------|-----------------|------------|
-| `MessageRouter` existe y funciona con CLI | Fase 3.v2, sección 3v2.1 | ✅ SÍ |
-| `CLIMessageSource` implementada | Fase 3.v2, sección 3v2.2 | ✅ SÍ |
-| Proactive loops usan router | Fase 3.v2, sección 3v2.3 | ✅ SÍ |
-| `lastActiveChannel` en ProactiveState | Fase 3.v2, sección 3v2.4 | ✅ SÍ |
-| user.md tiene `Channel Preferences` | Fase 3.v2, sección 3v2.5 | ✅ SÍ |
+| `MessageRouter` existe y funciona con CLI | Fase 3, sección 3.9 | ✅ SÍ |
+| `CLIMessageSource` implementada | Fase 3, sección 3.9 | ✅ SÍ |
+| Proactive loops usan `router.sendNotification()` | Fase 3, secciones 3.6-3.7 | ✅ SÍ |
+| `lastActiveChannel` en ProactiveState | Fase 3, sección 3.8 | ✅ SÍ |
+| user.md tiene `Channel Preferences` | Fase 3, sección 3.11 | ✅ SÍ |
 
-**Si algún requisito falta:** Completar Fase 3.v2 antes de iniciar Fase 4.
+**Si algún requisito falta:** Completar Fase 3 antes de iniciar Fase 4.
 
 ---
 
@@ -3707,37 +3596,40 @@ Análisis arquitectónico realizado ANTES de comenzar Fase 4 para asegurar que l
     - Comandos: `/quiet` global, `/quiet here` per-channel
 38. [x] **Actualización del plan:**
     - Nueva sección "Abstracciones de Canal" con interfaces completas
-    - Nueva sección "FASE 3.v2: Preparación Multi-Canal" (trabajo ADICIONAL sobre Fase 3 existente)
+    - Fase 3 unificada: proactividad + channel layer (multi-canal ready desde el inicio)
     - Fase 4 expandida con pre-requisitos, arquitectura, y 4 días de implementación
     - Nueva sección "Deuda Técnica Explícita" (8 items documentados)
 
-### Implementación FASE 3.v2 (Preparación Multi-Canal)
-
-> **IMPORTANTE:** Fase 3 ya está implementada. Estos son cambios ADICIONALES.
-
-39. [ ] Implementar `MessageRouter` (src/interfaces/message-router.ts)
-40. [ ] Implementar `CLIMessageSource` (src/interfaces/cli-source.ts)
-41. [ ] Refactorizar cli.ts para usar MessageRouter
-42. [ ] Refactorizar proactive loops para usar router.sendNotification()
-43. [ ] Agregar `lastActiveChannel` a ProactiveState
-44. [ ] Tests de regresión: CLI funciona exactamente igual post-refactor
-45. [ ] Commit: "[Fase 3.v2] Preparación multi-canal"
-
 ### Implementación FASE 4 (WhatsApp)
 
-> **Prerequisito:** Fase 3.v2 completada.
+> **Prerequisito:** Fase 3 completada (incluye MessageRouter + CLISource).
 
-46. [ ] WhatsApp Connection Layer
-47. [ ] WhatsAppMessageSource
-48. [ ] WhatsAppNotificationSink
-49. [ ] Message Queue
-50. [ ] Comandos cross-channel
-51. [ ] Mitigaciones W1-W4
-52. [ ] Commit: "[Fase 4] WhatsApp Bridge"
+39. [ ] WhatsApp Connection Layer
+40. [ ] WhatsAppMessageSource
+41. [ ] WhatsAppNotificationSink
+42. [ ] Message Queue
+43. [ ] Comandos cross-channel
+44. [ ] Mitigaciones W1-W4
+45. [ ] Commit: "[Fase 4] WhatsApp Bridge"
 
 ---
 
 ## Changelog
+
+### 2026-01-31 (actualización 15) - Fase 3 Unificada (Multi-Canal desde el inicio)
+
+**Corrección:** Fase 3 no estaba implementada. Se unificó Fase 3 + Fase 3.v2 en una sola fase coherente.
+
+**Cambios:**
+- Eliminada sección "FASE 3.v2" (ya no es necesaria)
+- Fase 3 ahora incluye Channel Layer (MessageRouter, CLISource, CLISink) desde el inicio
+- Actualizado orden de implementación: Día 3 incluye setup de channel layer
+- Pre-requisitos de Fase 4 ahora referencian secciones de Fase 3
+- Próximos pasos simplificados
+
+**Resultado:** Una sola Fase 3 que produce proactividad + arquitectura multi-canal ready.
+
+---
 
 ### 2026-01-31 (actualización 14) - Design Review Pre-FASE 4 (Multi-Canal)
 
@@ -3759,13 +3651,13 @@ Análisis arquitectónico realizado ANTES de comenzar Fase 4 para asegurar que l
 
 **Nuevas secciones agregadas al plan:**
 - "Abstracciones de Canal" después de "Componentes Clave" (~150 líneas)
-- "FASE 3.v2: Preparación Multi-Canal" — trabajo ADICIONAL sobre Fase 3 existente (~150 líneas)
+- Fase 3 expandida con Channel Layer (MessageRouter, CLISource, etc.)
 - Fase 4 expandida de 30 a ~200 líneas con arquitectura, bugs W1-W4, y plan de 4 días
 - "Deuda Técnica Explícita" con 8 items (DT-1 a DT-8)
 
-**Reorganización:**
-- Fase 3.v2 creada como fase intermedia entre Fase 3 y Fase 4
-- Pre-requisitos de Fase 4 ahora referencian Fase 3.v2
+**Decisiones de diseño:**
+- Estado proactivo es GLOBAL (no per-channel)
+- Routing de proactivos: reminders a todos, espontáneos solo a primary
 - user.md template actualizado con Channel Preferences
 
 ---
