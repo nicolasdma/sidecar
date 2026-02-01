@@ -19,6 +19,7 @@ import { extractSignificantWords } from './stopwords.js';
 import { createLogger } from '../utils/logger.js';
 import { getDecayStatus } from './decay-service.js';
 import { isEmbeddingsEnabled } from './embeddings-state.js';
+import { deleteFactVector } from './embeddings-loader.js';
 
 const logger = createLogger('facts-store');
 
@@ -251,9 +252,29 @@ export function supersedeFact(oldId: string, newFact: NewFact): string {
 
 /**
  * Deletes a fact by ID.
+ * Also cleans up the fact_vectors virtual table to prevent orphan vectors.
+ * Note: fact_embeddings is cleaned up automatically via ON DELETE CASCADE.
  */
 export function deleteFact(id: string): boolean {
   const db = getDatabase();
+
+  // First, clean up fact_vectors (virtual table, no FK cascade support)
+  // This must be done before deleting from facts table
+  if (isEmbeddingsEnabled()) {
+    try {
+      deleteFactVector(db, id);
+      logger.debug('Cleaned up fact vector', { id });
+    } catch (error) {
+      // Vector table might not exist if sqlite-vec didn't load
+      // This is fine - just log and continue with fact deletion
+      logger.debug('Could not delete fact vector (table may not exist)', {
+        id,
+        error: error instanceof Error ? error.message : 'Unknown',
+      });
+    }
+  }
+
+  // Delete the fact (fact_embeddings cleaned up via CASCADE)
   const stmt = db.prepare('DELETE FROM facts WHERE id = ?');
   const result = stmt.run(id);
 

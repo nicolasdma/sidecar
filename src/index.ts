@@ -6,6 +6,7 @@ import { runDecayCheck } from './memory/decay-service.js';
 import { startExtractionWorker, stopExtractionWorker } from './memory/extraction-service.js';
 import { initializeEmbeddings, getEmbeddingsStatusMessage } from './memory/embeddings-state.js';
 import { startEmbeddingWorker, stopEmbeddingWorker } from './memory/embedding-worker.js';
+import { disposePipeline } from './memory/embeddings-model.js';
 
 const logger = createLogger('main');
 
@@ -41,26 +42,29 @@ async function main(): Promise<void> {
     logger.warn('Embeddings initialization failed', { error });
   }
 
-  process.on('SIGINT', () => {
+  process.on('SIGINT', async () => {
     console.log('\n\nRecibida señal de interrupción, cerrando...');
     stopEmbeddingWorker();
     stopExtractionWorker();
+    await disposePipeline(); // Free embedding model memory
     closeDatabase();
     process.exit(0);
   });
 
-  process.on('SIGTERM', () => {
+  process.on('SIGTERM', async () => {
     logger.info('Received SIGTERM, shutting down...');
     stopEmbeddingWorker();
     stopExtractionWorker();
+    await disposePipeline(); // Free embedding model memory
     closeDatabase();
     process.exit(0);
   });
 
-  process.on('uncaughtException', (error) => {
+  process.on('uncaughtException', async (error) => {
     logger.error('Uncaught exception', error);
     stopEmbeddingWorker();
     stopExtractionWorker();
+    await disposePipeline(); // Free embedding model memory
     closeDatabase();
     process.exit(1);
   });

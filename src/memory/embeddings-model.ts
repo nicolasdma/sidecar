@@ -25,6 +25,29 @@ let nextRetryTime = 0;
 
 const MAX_LOAD_ATTEMPTS = 3;
 const INITIAL_RETRY_DELAY_MS = 5000; // 5 seconds
+const EMBEDDING_TIMEOUT_MS = 30000; // 30 seconds timeout for embedding operations
+
+/**
+ * Wraps a promise with a timeout.
+ * Rejects with TimeoutError if the promise doesn't resolve within the specified time.
+ */
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operation: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${operation} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    promise
+      .then((result) => {
+        clearTimeout(timer);
+        resolve(result);
+      })
+      .catch((error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+  });
+}
 
 /**
  * Progress callback type for model download.
@@ -125,7 +148,7 @@ async function ensureModelLoaded(): Promise<void> {
  *
  * @param text - Text to embed
  * @returns 384-dimensional embedding vector
- * @throws Error if model not loaded or embedding fails
+ * @throws Error if model not loaded, embedding fails, or operation times out
  */
 export async function embedText(text: string): Promise<Float32Array> {
   await ensureModelLoaded();
@@ -134,10 +157,15 @@ export async function embedText(text: string): Promise<Float32Array> {
     throw new Error('Embedding model not loaded');
   }
 
-  const output = await embeddingPipeline(text, {
-    pooling: 'mean',
-    normalize: true,
-  });
+  // Wrap embedding operation with timeout to prevent hung workers
+  const output = await withTimeout(
+    embeddingPipeline(text, {
+      pooling: 'mean',
+      normalize: true,
+    }),
+    EMBEDDING_TIMEOUT_MS,
+    'Embedding operation'
+  );
 
   // Extract the data from the tensor
   return new Float32Array(output.data);
@@ -201,4 +229,31 @@ export function getModelStatus(): {
     attempts: loadAttempts,
     nextRetryIn: nextRetryTime > Date.now() ? nextRetryTime - Date.now() : null,
   };
+}
+
+/**
+ * Disposes the embedding pipeline to free memory.
+ * Should be called on application shutdown to prevent memory leaks.
+ */
+export async function disposePipeline(): Promise<void> {
+  if (!embeddingPipeline) {
+    return;
+  }
+
+  try {
+    // transformers.js pipelines may have a dispose method
+    if (typeof (embeddingPipeline as unknown as { dispose?: () => Promise<void> }).dispose === 'function') {
+      await (embeddingPipeline as unknown as { dispose: () => Promise<void> }).dispose();
+      logger.info('Embedding pipeline disposed via dispose()');
+    }
+  } catch (error) {
+    logger.warn('Error disposing embedding pipeline', {
+      error: error instanceof Error ? error.message : 'Unknown',
+    });
+  } finally {
+    // Always clear the reference to allow garbage collection
+    embeddingPipeline = null;
+    loadingPromise = null;
+    logger.info('Embedding pipeline reference cleared');
+  }
 }
