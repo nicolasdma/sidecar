@@ -129,9 +129,9 @@ async function logStartupStatus(
     warnings.push(`⚠️  Large extraction backlog: ${extractionQueue} items pending`);
   }
 
-  if (embeddingQueue > 50) {
-    warnings.push(`⚠️  Large embedding backlog: ${embeddingQueue} items pending`);
-  }
+  // Note: Embedding backlog warning removed from startup since model loads lazily.
+  // Queue accumulates until first semantic search triggers model load.
+  // Use /health to check embedding status.
 
   if (warnings.length > 0) {
     console.log(warnings.join('\n') + '\n');
