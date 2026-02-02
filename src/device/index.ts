@@ -189,12 +189,12 @@ export async function initializeDevice(config?: DeviceConfig): Promise<{
       }
     }
 
-    // Schedule background preload of most-used productivity model
-    // This runs 15s after startup to not block the user
+    // OPTIMIZATION: Schedule background preload of productivity model
+    // Reduced from 15s to 3s since classifier warmup is now non-blocking
     if (currentProfile.tier !== 'basic') {
       const primaryModel = currentProfile.recommendedModels[0];
       if (primaryModel) {
-        getModelManager().scheduleBackgroundPreload(primaryModel, 15000);
+        getModelManager().scheduleBackgroundPreload(primaryModel, 3000);
       }
     }
   }

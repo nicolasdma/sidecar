@@ -61,6 +61,27 @@ let isProcessing = false;
 let ollamaAvailable = false;
 let lastOllamaCheck = 0;
 
+// OPTIMIZATION: Cooling period to avoid competing with user requests for Ollama
+// Extraction waits this long after last user activity before processing
+const COOLING_PERIOD_MS = 15_000; // 15 seconds
+let lastUserActivityTime = 0;
+
+/**
+ * Records user activity to trigger cooling period.
+ * Call this when a user message is received.
+ */
+export function recordUserActivity(): void {
+  lastUserActivityTime = Date.now();
+}
+
+/**
+ * Checks if we're in cooling period after user activity.
+ */
+function isInCoolingPeriod(): boolean {
+  if (lastUserActivityTime === 0) return false;
+  return Date.now() - lastUserActivityTime < COOLING_PERIOD_MS;
+}
+
 // ============================================================================
 // Circuit Breaker (Fase 3.6 - Track B hardening)
 // Prevents excessive retries when Ollama is consistently failing.
@@ -331,6 +352,13 @@ async function checkOllamaWithCache(): Promise<boolean> {
 async function processExtractionQueue(): Promise<void> {
   // Prevent concurrent processing
   if (isProcessing) {
+    return;
+  }
+
+  // OPTIMIZATION: Wait for cooling period after user activity
+  // This prevents extraction from competing with user requests for Ollama
+  if (isInCoolingPeriod()) {
+    logger.debug('In cooling period, deferring extraction');
     return;
   }
 

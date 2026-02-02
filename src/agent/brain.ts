@@ -12,16 +12,16 @@ import {
   type ToolExecutionContext,
 } from '../tools/index.js';
 import { saveMessage, loadHistory } from '../memory/store.js';
-import { queueForExtraction } from '../memory/extraction-service.js';
+import { queueForExtraction, recordUserActivity } from '../memory/extraction-service.js';
 import { createLogger } from '../utils/logger.js';
-import { config } from '../utils/config.js';
-import { getLocalRouter, type LocalRouter } from './local-router/index.js';
 import {
   routeV2,
   isRouterV2Initialized,
   isLikelySimpleChat,
 } from './local-router/router-v2.js';
+import { executeIntent } from './local-router/direct-executor.js';
 import { executeLocalIntent } from './local-router/local-executor.js';
+import type { Intent } from './local-router/types.js';
 import {
   executeProductivityTool,
   formatProductivityResult,
@@ -66,17 +66,11 @@ export class Brain {
   private maxToolIterations: number;
   private maxContextTokens: number;
   private initialized: boolean = false;
-  private localRouter: LocalRouter | null = null;
 
   constructor(brainConfig?: BrainConfig) {
     this.client = createKimiClient();
     this.maxToolIterations = brainConfig?.maxToolIterations ?? MAX_TOOL_ITERATIONS;
     this.maxContextTokens = brainConfig?.maxContextTokens ?? 100000;
-
-    // Fase 3.5: Initialize LocalRouter if enabled
-    if (config.localRouter.enabled) {
-      this.localRouter = getLocalRouter(config.localRouter);
-    }
   }
 
   private initialize(): void {
@@ -143,6 +137,9 @@ export class Brain {
     // Record message for metrics (only reactive mode counts as user message)
     if (!isProactiveMode) {
       recordMessageProcessed();
+      // OPTIMIZATION: Record user activity to trigger extraction cooling period
+      // This prevents extraction from competing with user requests for Ollama
+      recordUserActivity();
     }
 
     logger.debug('Starting new turn', {
@@ -151,143 +148,123 @@ export class Brain {
       proactiveContext: options.proactiveContext,
     });
 
-    // Fase 3.5: Pre-Brain routing (only for user messages, not proactive mode)
-    // INVARIANTE: Proactive mode ALWAYS bypasses LocalRouter
-    if (
-      !isProactiveMode &&
-      options.userInput &&
-      this.localRouter &&
-      config.localRouter.enabled
-    ) {
-      // Fase 3.6: Check if router is in backoff and alert user
-      const routerStats = this.localRouter.getStats();
-      if (routerStats.backoff?.inBackoff) {
-        logger.debug('LocalRouter in backoff, using LLM directly');
-      }
+    // OPTIMIZED: Unified 3-tier routing via routeV2
+    // Replaces dual LocalRouter + RouterV2 flow with single classification
+    // Uses fast-path patterns for common intents (translate, time, weather)
+    if (!isProactiveMode && options.userInput && isRouterV2Initialized()) {
+      const routeResult = await routeV2(options.userInput);
 
-      const routingResult = await this.localRouter.tryRoute(options.userInput);
+      // Tier 1: Deterministic (time, weather, reminders) - direct tool execution
+      if (routeResult.tier === 'deterministic') {
+        const intent = routeResult.intent as Intent;
+        const params = routeResult.params || {};
 
-      // Alert if routing was slow (likely due to Ollama issues)
-      if (routingResult.latencyMs && routingResult.latencyMs > 5000) {
-        console.log(`\n⏳ Nota: Hubo latencia en el routing (${(routingResult.latencyMs / 1000).toFixed(1)}s). Considerá verificar Ollama con /health.\n`);
-      }
+        logger.info('Deterministic route', {
+          intent,
+          confidence: routeResult.confidence,
+          reason: routeResult.reason,
+        });
 
-      if (routingResult.route === 'DIRECT_TOOL') {
-        const execResult = await this.localRouter.executeDirect(
-          routingResult.intent,
-          routingResult.params || {}
-        );
+        const execResult = await executeIntent(intent, params);
 
         if (execResult.success) {
-          // Save with SAME format as agentic loop
           this.saveDirectResponse(options.userInput, execResult.response);
-
-          // Record metrics
           recordLocalRouterHit();
 
-          logger.info('Direct execution successful', {
-            intent: routingResult.intent,
-            latency_ms: execResult.latencyMs,
+          logger.info('Deterministic execution successful', {
+            intent,
+            latencyMs: execResult.latencyMs,
           });
 
           return execResult.response;
         }
 
-        // Tool failed -> fallback to Brain WITH CONTEXT
-        this.localRouter.recordFallback();
-        recordLocalRouterBypass(); // Record fallback as bypass
-
-        logger.warn('Direct execution failed, falling back to Brain', {
-          intent: routingResult.intent,
+        // Deterministic failed -> fallback to API
+        logger.warn('Deterministic execution failed, falling back to API', {
+          intent,
           error: execResult.error,
         });
-
-        // Continue to agentic loop - the message will be saved below
-        // Note: We don't pass previous attempt context yet (could be added later)
-      } else {
-        // ROUTE_TO_LLM -> record bypass
         recordLocalRouterBypass();
+        // Continue to agentic loop
       }
-    }
 
-    // Fase 3.6b: Productivity tools via Router v2
-    // Try local LLM for translate, grammar_check, summarize, explain, simple_chat
-    if (
-      !isProactiveMode &&
-      options.userInput &&
-      isRouterV2Initialized()
-    ) {
-      const v2Result = await routeV2(options.userInput);
+      // Tier 2: Local LLM (translate, grammar, summarize, simple_chat)
+      if (routeResult.tier === 'local' && routeResult.model) {
+        const intent = routeResult.intent as string;
 
-      // Only process if tier is 'local' (not deterministic - already handled above)
-      if (v2Result.tier === 'local' && v2Result.model) {
-        const intent = v2Result.intent as string;
-
-        // Check if it's a productivity intent
+        // Productivity intents (translate, grammar_check, summarize)
         if (isProductivityIntent(intent)) {
-          logger.info('Routing to productivity tool', {
+          logger.info('Local LLM route (productivity)', {
             intent,
-            model: v2Result.model,
-            confidence: v2Result.confidence,
+            model: routeResult.model,
+            confidence: routeResult.confidence,
           });
 
           const toolResult = await executeProductivityTool(
             intent,
             options.userInput,
-            v2Result.model,
-            v2Result.params
+            routeResult.model,
+            routeResult.params
           );
 
           if (toolResult.success) {
             const response = formatProductivityResult(intent, toolResult);
-
-            // Save with same format as agentic loop
             this.saveDirectResponse(options.userInput, response);
-
-            // Record metrics (tokensGenerated not tracked for productivity tools)
             recordLocalRequest(intent, toolResult.latencyMs, 0, true);
+            recordLocalRouterHit();
 
-            logger.info('Productivity tool execution successful', {
+            logger.info('Productivity tool successful', {
               intent,
-              model: v2Result.model,
+              model: routeResult.model,
               latencyMs: toolResult.latencyMs,
             });
 
             return response;
           }
 
-          // Productivity tool failed -> fallback to API
+          // Productivity failed -> fallback to API
           logger.warn('Productivity tool failed, falling back to API', {
             intent,
             error: toolResult.error,
           });
           recordLocalToApiFallback(intent);
           // Continue to agentic loop
-        } else if (intent === 'simple_chat') {
-          // Handle simple chat with local model (greetings, thanks, etc.)
-          if (isLikelySimpleChat(options.userInput)) {
-            logger.info('Routing to simple chat', {
-              model: v2Result.model,
-            });
-
-            const chatResult = await executeLocalIntent(
-              'simple_chat',
-              options.userInput,
-              v2Result.model
-            );
-
-            if (chatResult.success && chatResult.response) {
-              this.saveDirectResponse(options.userInput, chatResult.response);
-              recordLocalRequest('simple_chat', chatResult.latencyMs, chatResult.tokensGenerated || 0, true);
-
-              return chatResult.response;
-            }
-
-            // Simple chat failed, continue to agentic loop
-            logger.debug('Simple chat failed, falling back to API');
-            recordLocalToApiFallback('simple_chat');
-          }
         }
+
+        // Simple chat (greetings, thanks, etc.)
+        if (intent === 'simple_chat' && isLikelySimpleChat(options.userInput)) {
+          logger.info('Local LLM route (simple_chat)', {
+            model: routeResult.model,
+          });
+
+          const chatResult = await executeLocalIntent(
+            'simple_chat',
+            options.userInput,
+            routeResult.model
+          );
+
+          if (chatResult.success && chatResult.response) {
+            this.saveDirectResponse(options.userInput, chatResult.response);
+            recordLocalRequest('simple_chat', chatResult.latencyMs, chatResult.tokensGenerated || 0, true);
+            recordLocalRouterHit();
+
+            return chatResult.response;
+          }
+
+          // Simple chat failed -> fallback to API
+          logger.debug('Simple chat failed, falling back to API');
+          recordLocalToApiFallback('simple_chat');
+          // Continue to agentic loop
+        }
+      }
+
+      // Tier 3: API - handled by agentic loop below
+      if (routeResult.tier === 'api') {
+        logger.debug('API route', {
+          intent: routeResult.intent,
+          reason: routeResult.reason,
+        });
+        recordLocalRouterBypass();
       }
     }
 

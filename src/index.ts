@@ -222,15 +222,26 @@ async function main(): Promise<void> {
     logger.warn('Embeddings initialization failed', { error });
   }
 
-  // Fase 3.5: Initialize and warm up LocalRouter
-  // Uses classifier model from device profile (or default if device init failed)
+  // Fase 3.5 + OPTIMIZATION: Initialize LocalRouter with NON-BLOCKING warmup
+  // The classifier warms up in background, first request may be slightly slower
+  // but startup is ~3.5 seconds faster
   let localRouterReady = false;
   if (config.localRouter.enabled) {
     try {
       const classifierModel = deviceProfile?.classifierModel;
-      await initializeLocalRouter(config.localRouter, true, classifierModel);
+      // Initialize WITHOUT warmup (warmup=false), then trigger async warmup
+      const router = await initializeLocalRouter(config.localRouter, false, classifierModel);
       localRouterReady = true;
-      logger.info('LocalRouter initialized');
+      logger.info('LocalRouter initialized (warming up in background)');
+
+      // Non-blocking warmup - don't await, let it happen in background
+      router.warmup().then(() => {
+        logger.debug('LocalRouter warmup completed in background');
+      }).catch((err) => {
+        logger.warn('Background warmup failed', {
+          error: err instanceof Error ? err.message : err,
+        });
+      });
     } catch (error) {
       logger.warn('LocalRouter initialization failed, will retry on first request', {
         error: error instanceof Error ? error.message : error,
