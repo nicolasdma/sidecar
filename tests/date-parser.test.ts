@@ -137,6 +137,74 @@ test('en 2 horas y 15 minutos', () => {
   assertDateEqual(result.datetime, expected);
 });
 
+// ==================== English Relative Time Tests ====================
+
+console.log('\n=== English Relative Time ===');
+
+test('5 minutes (English)', () => {
+  const now = createTestNow(2026, 2, 1, 14, 0); // 14:00
+  const result = parseDateTime('5 minutes', TEST_TIMEZONE, now);
+  assert(result.success, 'Should parse "5 minutes"');
+  const expected = createTestNow(2026, 2, 1, 14, 5); // 14:05
+  assertDateEqual(result.datetime, expected);
+});
+
+test('1 minute (singular, English)', () => {
+  const now = createTestNow(2026, 2, 1, 14, 0);
+  const result = parseDateTime('1 minute', TEST_TIMEZONE, now);
+  assert(result.success, 'Should parse "1 minute"');
+  const expected = createTestNow(2026, 2, 1, 14, 1);
+  assertDateEqual(result.datetime, expected);
+});
+
+test('in 30 minutes (English with in)', () => {
+  const now = createTestNow(2026, 2, 1, 14, 0);
+  const result = parseDateTime('in 30 minutes', TEST_TIMEZONE, now);
+  assert(result.success, 'Should parse "in 30 minutes"');
+  const expected = createTestNow(2026, 2, 1, 14, 30);
+  assertDateEqual(result.datetime, expected);
+});
+
+test('2 hours (English)', () => {
+  const now = createTestNow(2026, 2, 1, 14, 0);
+  const result = parseDateTime('2 hours', TEST_TIMEZONE, now);
+  assert(result.success, 'Should parse "2 hours"');
+  const expected = createTestNow(2026, 2, 1, 16, 0);
+  assertDateEqual(result.datetime, expected);
+});
+
+test('1 hour (singular, English)', () => {
+  const now = createTestNow(2026, 2, 1, 14, 0);
+  const result = parseDateTime('1 hour', TEST_TIMEZONE, now);
+  assert(result.success, 'Should parse "1 hour"');
+  const expected = createTestNow(2026, 2, 1, 15, 0);
+  assertDateEqual(result.datetime, expected);
+});
+
+test('in 1 hour (English with in)', () => {
+  const now = createTestNow(2026, 2, 1, 14, 0);
+  const result = parseDateTime('in 1 hour', TEST_TIMEZONE, now);
+  assert(result.success, 'Should parse "in 1 hour"');
+  const expected = createTestNow(2026, 2, 1, 15, 0);
+  assertDateEqual(result.datetime, expected);
+});
+
+test('1 hour and 30 minutes (English compound)', () => {
+  const now = createTestNow(2026, 2, 1, 14, 0);
+  const result = parseDateTime('1 hour and 30 minutes', TEST_TIMEZONE, now);
+  assert(result.success, 'Should parse "1 hour and 30 minutes"');
+  const expected = createTestNow(2026, 2, 1, 15, 30);
+  assertDateEqual(result.datetime, expected);
+});
+
+test('in 2 hours and 15 minutes (English compound with in)', () => {
+  const now = createTestNow(2026, 2, 1, 14, 0);
+  const result = parseDateTime('in 2 hours and 15 minutes', TEST_TIMEZONE, now);
+  assert(result.success, 'Should parse "in 2 hours and 15 minutes"');
+  const expected = createTestNow(2026, 2, 1, 16, 15);
+  assertDateEqual(result.datetime, expected);
+});
+
 // ==================== "mañana a las X" Tests ====================
 
 console.log('\n=== "mañana a las X" ===');

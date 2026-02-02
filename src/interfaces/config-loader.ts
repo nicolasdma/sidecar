@@ -100,7 +100,7 @@ export function ensureUserMdExists(): void {
 ## Communication Preferences
 - Proactivity level: medium
 - Quiet hours: 22:00 - 08:00
-- Timezone: America/Argentina/Buenos_Aires
+- Timezone: America/Bogota
 - Language: es
 
 ## Channel Preferences

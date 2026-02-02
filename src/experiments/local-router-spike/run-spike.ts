@@ -145,9 +145,10 @@ function calculateResults(results: TestResult[]): SpikeResults {
 
   // Calculate accuracies
   for (const intent of Object.keys(byIntent)) {
-    byIntent[intent].accuracy = byIntent[intent].total > 0
-      ? byIntent[intent].correct / byIntent[intent].total
-      : 0;
+    const entry = byIntent[intent];
+    if (entry) {
+      entry.accuracy = entry.total > 0 ? entry.correct / entry.total : 0;
+    }
   }
 
   return {

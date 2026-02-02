@@ -70,7 +70,7 @@ export const DEFAULT_PROACTIVE_CONFIG: ProactiveConfig = {
   circuitBreakerThreshold: 5,
   llmTimeoutMs: 10000,
   proactivityLevel: 'low',                    // Conservative default
-  timezone: 'UTC',
+  timezone: 'America/Bogota',                 // Colombia (UTC-5) - hardcoded for now
   language: 'es',
   morningGreetingStart: 8,
   morningGreetingEnd: 10,

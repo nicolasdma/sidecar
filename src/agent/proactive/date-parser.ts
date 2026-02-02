@@ -111,13 +111,15 @@ function parseISO(input: string, timezone: string): DateParseResult | null {
 }
 
 /**
- * Parse relative time: "en N minutos", "en N horas", "en N horas y M minutos"
+ * Parse relative time in Spanish and English:
+ * Spanish: "en N minutos", "en N horas", "en N horas y M minutos"
+ * English: "N minutes", "N hours", "in N minutes", "N hours and M minutes"
  */
 function parseRelative(input: string, now: Date): DateParseResult | null {
-  // Match "en N minuto(s)"
-  const minutesOnly = input.match(/^en\s+(\d+)\s+minutos?$/i);
-  if (minutesOnly) {
-    const minutes = parseInt(minutesOnly[1]!, 10);
+  // Spanish: "en N minuto(s)"
+  const minutesOnlyEs = input.match(/^en\s+(\d+)\s+minutos?$/i);
+  if (minutesOnlyEs) {
+    const minutes = parseInt(minutesOnlyEs[1]!, 10);
     const result = new Date(now.getTime() + minutes * 60 * 1000);
     return {
       success: true,
@@ -125,10 +127,21 @@ function parseRelative(input: string, now: Date): DateParseResult | null {
     };
   }
 
-  // Match "en N hora(s)"
-  const hoursOnly = input.match(/^en\s+(\d+)\s+horas?$/i);
-  if (hoursOnly) {
-    const hours = parseInt(hoursOnly[1]!, 10);
+  // English: "N minute(s)" or "in N minute(s)"
+  const minutesOnlyEn = input.match(/^(?:in\s+)?(\d+)\s+minutes?$/i);
+  if (minutesOnlyEn) {
+    const minutes = parseInt(minutesOnlyEn[1]!, 10);
+    const result = new Date(now.getTime() + minutes * 60 * 1000);
+    return {
+      success: true,
+      datetime: result,
+    };
+  }
+
+  // Spanish: "en N hora(s)"
+  const hoursOnlyEs = input.match(/^en\s+(\d+)\s+horas?$/i);
+  if (hoursOnlyEs) {
+    const hours = parseInt(hoursOnlyEs[1]!, 10);
     const result = new Date(now.getTime() + hours * 60 * 60 * 1000);
     return {
       success: true,
@@ -136,11 +149,35 @@ function parseRelative(input: string, now: Date): DateParseResult | null {
     };
   }
 
-  // Match "en N hora(s) y M minuto(s)"
-  const compound = input.match(/^en\s+(\d+)\s+horas?\s+y\s+(\d+)\s+minutos?$/i);
-  if (compound) {
-    const hours = parseInt(compound[1]!, 10);
-    const minutes = parseInt(compound[2]!, 10);
+  // English: "N hour(s)" or "in N hour(s)"
+  const hoursOnlyEn = input.match(/^(?:in\s+)?(\d+)\s+hours?$/i);
+  if (hoursOnlyEn) {
+    const hours = parseInt(hoursOnlyEn[1]!, 10);
+    const result = new Date(now.getTime() + hours * 60 * 60 * 1000);
+    return {
+      success: true,
+      datetime: result,
+    };
+  }
+
+  // Spanish: "en N hora(s) y M minuto(s)"
+  const compoundEs = input.match(/^en\s+(\d+)\s+horas?\s+y\s+(\d+)\s+minutos?$/i);
+  if (compoundEs) {
+    const hours = parseInt(compoundEs[1]!, 10);
+    const minutes = parseInt(compoundEs[2]!, 10);
+    const totalMs = (hours * 60 + minutes) * 60 * 1000;
+    const result = new Date(now.getTime() + totalMs);
+    return {
+      success: true,
+      datetime: result,
+    };
+  }
+
+  // English: "N hour(s) and M minute(s)" or "in N hour(s) and M minute(s)"
+  const compoundEn = input.match(/^(?:in\s+)?(\d+)\s+hours?\s+and\s+(\d+)\s+minutes?$/i);
+  if (compoundEn) {
+    const hours = parseInt(compoundEn[1]!, 10);
+    const minutes = parseInt(compoundEn[2]!, 10);
     const totalMs = (hours * 60 + minutes) * 60 * 1000;
     const result = new Date(now.getTime() + totalMs);
     return {
@@ -441,6 +478,9 @@ export function parseDateTime(
   }
 
   // Use current time if not provided
+  // NOTE: new Date() returns the correct UTC timestamp regardless of system timezone.
+  // Relative calculations ("in 5 minutes") work correctly because we add milliseconds
+  // to the current UTC timestamp. The timezone parameter is only used for formatting.
   const currentTime = now ?? new Date();
 
   // Normalize input: trim, collapse whitespace, lowercase for matching

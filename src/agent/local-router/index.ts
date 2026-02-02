@@ -41,7 +41,7 @@ const DEFAULT_CONFIG: LocalRouterConfig = {
   enabled: true,
   confidenceThreshold: 0.8,
   ollamaTimeout: 30000,
-  maxLatencyBeforeBypass: 2000,
+  maxLatencyBeforeBypass: 60000,  // 60 seconds - very generous for debugging
 };
 
 /**

@@ -89,7 +89,7 @@ export const config = {
     /** Timeout for Ollama requests in ms */
     ollamaTimeout: parseInt(process.env.LOCAL_ROUTER_TIMEOUT || '30000', 10),
     /** Max latency before bypassing to Brain in ms */
-    maxLatencyBeforeBypass: parseInt(process.env.LOCAL_ROUTER_MAX_LATENCY || '2000', 10),
+    maxLatencyBeforeBypass: parseInt(process.env.LOCAL_ROUTER_MAX_LATENCY || '60000', 10),
   },
 } as const;
 

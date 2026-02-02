@@ -256,10 +256,10 @@ export class Brain {
         continue;
       }
 
-      const finalContent = response.content ?? '';
+      const rawContent = response.content ?? '';
 
       // Handle empty response
-      if (!finalContent) {
+      if (!rawContent) {
         logger.warn('LLM returned empty response', { finishReason: response.finishReason });
         const fallbackContent = 'No pude generar una respuesta. ¿Podés reformular tu pregunta?';
         const assistantMessage: AssistantMessage = {
@@ -269,6 +269,10 @@ export class Brain {
         saveMessage(assistantMessage);
         return fallbackContent;
       }
+
+      // BUG-001 Fix: Detect and handle JSON responses with shouldSpeak format
+      // This can happen when the LLM confuses reactive mode with proactive mode
+      const finalContent = this.extractMessageFromJsonIfNeeded(rawContent);
 
       const assistantMessage: AssistantMessage = {
         role: 'assistant',
@@ -292,6 +296,50 @@ export class Brain {
 
   getHistory(): Message[] {
     return loadHistory();
+  }
+
+  /**
+   * BUG-001 Fix: Extract message from JSON if the LLM responded with shouldSpeak format.
+   * This can happen when the LLM confuses reactive mode with proactive mode.
+   */
+  private extractMessageFromJsonIfNeeded(content: string): string {
+    // Quick check: if it doesn't look like JSON with shouldSpeak, return as-is
+    if (!content.includes('shouldSpeak')) {
+      return content;
+    }
+
+    try {
+      // Try to find JSON in the response
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        return content;
+      }
+
+      const parsed = JSON.parse(jsonMatch[0]) as Record<string, unknown>;
+
+      // Check if it's the shouldSpeak format
+      if (typeof parsed.shouldSpeak !== 'boolean') {
+        return content;
+      }
+
+      logger.warn('LLM responded with proactive JSON format in reactive mode, extracting message');
+
+      // If shouldSpeak is false or message is empty, return a minimal acknowledgment
+      if (!parsed.shouldSpeak || !parsed.message || typeof parsed.message !== 'string' || !parsed.message.trim()) {
+        // Check if there's a reason that indicates the action was completed
+        const reason = typeof parsed.reason === 'string' ? parsed.reason : '';
+        if (reason.toLowerCase().includes('recordatorio') || reason.toLowerCase().includes('reminder')) {
+          return 'Listo.';
+        }
+        return 'Entendido.';
+      }
+
+      // Return the extracted message
+      return parsed.message;
+    } catch {
+      // JSON parse failed, return original content
+      return content;
+    }
   }
 
   /**

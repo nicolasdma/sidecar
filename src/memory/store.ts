@@ -526,6 +526,9 @@ export function getPendingReminders(): ReminderRow[] {
   return stmt.all() as ReminderRow[];
 }
 
+/**
+ * @deprecated Use getPastDueReminders() instead for V2 scheduler
+ */
 export function getDueReminders(windowMinutes: number = 5): ReminderRow[] {
   const database = getDatabase();
   const now = new Date();
@@ -540,6 +543,23 @@ export function getDueReminders(windowMinutes: number = 5): ReminderRow[] {
     ORDER BY trigger_at ASC
   `);
   return stmt.all(windowStart.toISOString(), windowEnd.toISOString()) as ReminderRow[];
+}
+
+/**
+ * Get all reminders that are past due (trigger_at <= now).
+ * Used by V2 scheduler for catch-up on startup.
+ */
+export function getPastDueReminders(): ReminderRow[] {
+  const database = getDatabase();
+  const now = new Date().toISOString();
+
+  const stmt = database.prepare(`
+    SELECT * FROM reminders
+    WHERE triggered = 0 AND cancelled = 0
+      AND trigger_at <= ?
+    ORDER BY trigger_at ASC
+  `);
+  return stmt.all(now) as ReminderRow[];
 }
 
 export function markReminderTriggered(id: string, status: 1 | 2): void {

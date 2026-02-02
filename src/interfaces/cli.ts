@@ -10,7 +10,7 @@ import { CLIMessageSource } from './cli-source.js';
 import { CLINotificationSink } from './cli-sink.js';
 import { getMessageRouter } from './message-router.js';
 import { DefaultCommandHandler } from './command-handler.js';
-import { startReminderScheduler, stopReminderScheduler } from '../agent/proactive/reminder-scheduler.js';
+import { startReminderScheduler, stopReminderScheduler } from '../agent/proactive/reminder-scheduler-v2.js';
 import {
   startSpontaneousLoop,
   stopSpontaneousLoop,

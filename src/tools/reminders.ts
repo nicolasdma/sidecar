@@ -20,6 +20,10 @@ import {
 import { createLogger } from '../utils/logger.js';
 import { config } from '../utils/config.js';
 import { readFileSync, existsSync } from 'fs';
+import {
+  notifyReminderCreated,
+  notifyReminderCancelled,
+} from '../agent/proactive/reminder-scheduler-v2.js';
 
 const logger = createLogger('tool:reminders');
 
@@ -157,6 +161,9 @@ SIEMPRE pasá el mensaje y la fecha/hora exactamente como el usuario la especifi
 
     try {
       saveReminder({ id, message: message.trim(), triggerAt });
+
+      // Notify scheduler V2 of new reminder
+      notifyReminderCreated(id, message.trim(), triggerAt);
 
       const formattedTime = triggerAt.toLocaleString('es-AR', {
         weekday: 'long',
@@ -379,6 +386,9 @@ Podés usar solo los primeros 8 caracteres del ID.`,
       const cancelled = cancelReminder(reminder.id);
 
       if (cancelled) {
+        // Notify scheduler V2 of cancelled reminder
+        notifyReminderCancelled(reminder.id);
+
         logger.info('Cancelled reminder', { id: reminder.id, message: reminder.message });
         return {
           success: true,
