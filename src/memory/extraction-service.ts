@@ -38,6 +38,11 @@ import {
   safeJsonParse,
   type ExtractedFact,
 } from './schemas.js';
+import {
+  recordFactExtracted,
+  recordExtractionFailure,
+  resetExtractionFailures,
+} from '../utils/metrics.js';
 
 const logger = createLogger('extraction');
 
@@ -135,6 +140,7 @@ async function processExtractionItem(item: PendingExtractionRow): Promise<boolea
     if (facts.length > 0) {
       for (const fact of facts) {
         saveFact(fact);
+        recordFactExtracted(); // Track auto-extracted facts
       }
       logger.info('Facts extracted and saved', {
         messageId: item.message_id,
@@ -143,10 +149,13 @@ async function processExtractionItem(item: PendingExtractionRow): Promise<boolea
     }
 
     markExtractionCompleted(item.id);
+    resetExtractionFailures(); // Reset failure counter on success
     return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     markExtractionFailed(item.id, message);
+    recordExtractionFailure(); // Track consecutive failures
+
     logger.warn('Extraction failed', {
       id: item.id,
       attempt: item.attempts + 1,

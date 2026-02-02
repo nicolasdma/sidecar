@@ -31,6 +31,20 @@ import {
   getTotalFactsCount,
 } from '../memory/facts-store.js';
 import { getLocalRouter } from '../agent/local-router/index.js';
+import { checkOllamaAvailability } from '../llm/ollama.js';
+import { getEmbeddingsState } from '../memory/embeddings-state.js';
+import { getPendingExtractionCount } from '../memory/store.js';
+import { getPendingEmbeddingCount } from '../memory/store.js';
+import {
+  getSessionMetrics,
+  getProactiveLoopHealth,
+  getReminderSchedulerHealth,
+  getExtractionQueueHealth,
+  getEmbeddingQueueHealth,
+  determineOverallHealth,
+  type SubsystemHealth,
+  type HealthStatus,
+} from '../utils/metrics.js';
 
 /**
  * Parse duration string like "1h", "30m", "2h".
@@ -111,6 +125,9 @@ export class DefaultCommandHandler implements CommandHandler {
       case 'router-stats':
         return this.handleRouterStats();
 
+      case 'health':
+        return this.handleHealth();
+
       default:
         return null; // Not handled - pass to LLM
     }
@@ -140,6 +157,7 @@ Comandos disponibles:
                      Dominios: health, preferences, work, relationships,
                      schedule, goals, general, all
   /router-stats    - Ver estadísticas del LocalRouter
+  /health          - Ver estado de salud del sistema
   /exit            - Salir del programa
   /help            - Mostrar esta ayuda
 `;
@@ -462,6 +480,152 @@ O usá /facts sin argumentos para ver el resumen.`;
 └─────────────────────────────────────┘`;
 
     return output;
+  }
+
+  private async handleHealth(): Promise<string> {
+    // Gather all subsystem health info
+    const extractionPending = getPendingExtractionCount();
+    const embeddingPending = getPendingEmbeddingCount();
+
+    // Check Ollama availability
+    const ollamaAvailable = await checkOllamaAvailability();
+    const ollamaHealth: SubsystemHealth = ollamaAvailable
+      ? { status: 'ok', message: 'Connected' }
+      : { status: 'down', message: 'Not available' };
+
+    // Check embeddings state
+    const embeddingsState = getEmbeddingsState();
+    const embeddingsHealth: SubsystemHealth = embeddingsState.enabled
+      ? embeddingsState.ready
+        ? { status: 'ok', message: 'Active' }
+        : embeddingsState.reason === 'circuit_breaker'
+          ? { status: 'degraded', message: 'Circuit breaker open' }
+          : { status: 'degraded', message: 'Loading...' }
+      : { status: 'down', message: this.getEmbeddingsDisabledReason(embeddingsState.reason) };
+
+    // Check LocalRouter
+    const router = getLocalRouter();
+    const routerStats = router.getStats();
+    const routerConfig = router.getConfig();
+    const routerHealth: SubsystemHealth = !routerConfig.enabled
+      ? { status: 'down', message: 'Disabled' }
+      : routerStats.backoff?.inBackoff
+        ? { status: 'degraded', message: 'In backoff' }
+        : { status: 'ok', message: 'Ready' };
+
+    // Queue health
+    const extractionQueueHealth = getExtractionQueueHealth(extractionPending);
+    const embeddingQueueHealth = getEmbeddingQueueHealth(embeddingPending);
+
+    // Loop health
+    const proactiveHealth = getProactiveLoopHealth();
+    const reminderHealth = getReminderSchedulerHealth();
+
+    // Determine overall health
+    const subsystems = {
+      ollama: ollamaHealth,
+      embeddings: embeddingsHealth,
+      localRouter: routerHealth,
+      extractionQueue: extractionQueueHealth,
+      embeddingQueue: embeddingQueueHealth,
+      proactiveLoop: proactiveHealth,
+      reminderScheduler: reminderHealth,
+    };
+    const overall = determineOverallHealth(subsystems);
+
+    // Session metrics
+    const session = getSessionMetrics();
+    const uptimeMs = Date.now() - session.startedAt.getTime();
+    const uptimeStr = this.formatUptime(uptimeMs);
+
+    // Build output
+    const statusIcon = (status: HealthStatus): string => {
+      switch (status) {
+        case 'ok': return '✓';
+        case 'degraded': return '◐';
+        case 'down': return '✗';
+        default: return '?';
+      }
+    };
+
+    const overallIcon = statusIcon(overall);
+    const overallLabel = overall === 'ok' ? 'Healthy' : overall === 'degraded' ? 'Degraded' : 'Issues';
+
+    let output = `
+┌─────────────────────────────────────┐
+│ System Health: ${overallIcon} ${overallLabel.padEnd(18)}│
+├─────────────────────────────────────┤
+│ Subsystems                          │
+│ ${statusIcon(ollamaHealth.status)} Ollama:        ${ollamaHealth.message.padEnd(17)}│
+│ ${statusIcon(embeddingsHealth.status)} Embeddings:    ${embeddingsHealth.message.padEnd(17)}│
+│ ${statusIcon(routerHealth.status)} LocalRouter:   ${routerHealth.message.padEnd(17)}│
+│ ${statusIcon(proactiveHealth.status)} Proactive:     ${proactiveHealth.message.slice(0, 17).padEnd(17)}│
+│ ${statusIcon(reminderHealth.status)} Reminders:     ${reminderHealth.message.slice(0, 17).padEnd(17)}│
+├─────────────────────────────────────┤
+│ Queues                              │
+│   Extraction:    ${String(extractionPending).padEnd(18)}│
+│   Embedding:     ${String(embeddingPending).padEnd(18)}│
+├─────────────────────────────────────┤
+│ Session (${uptimeStr})${' '.repeat(Math.max(0, 14 - uptimeStr.length))}│
+│   Messages:      ${String(session.messagesProcessed).padEnd(18)}│
+│   Facts saved:   ${String(session.factsSaved).padEnd(18)}│
+│   Facts inferred:${String(session.factsExtracted).padEnd(18)}│
+│   Embeddings:    ${String(session.embeddingsGenerated).padEnd(18)}│
+│   Router hits:   ${String(session.localRouterHits).padEnd(18)}│
+│   Truncations:   ${String(session.contextTruncations).padEnd(18)}│
+└─────────────────────────────────────┘`;
+
+    // Add warnings if needed
+    const warnings: string[] = [];
+
+    if (ollamaHealth.status === 'down') {
+      warnings.push('⚠️  Ollama not available - extraction and LocalRouter disabled');
+    }
+    if (embeddingsHealth.status === 'down') {
+      warnings.push('⚠️  Embeddings disabled - using keyword search only');
+    }
+    if (extractionPending > 50) {
+      warnings.push(`⚠️  Large extraction backlog: ${extractionPending} items`);
+    }
+    if (embeddingPending > 50) {
+      warnings.push(`⚠️  Large embedding backlog: ${embeddingPending} items`);
+    }
+    if (proactiveHealth.status === 'down') {
+      warnings.push('⚠️  Proactive loop may have stopped');
+    }
+    if (session.contextTruncations > 0) {
+      warnings.push(`⚠️  Context truncated ${session.contextTruncations} time(s) this session`);
+    }
+
+    if (warnings.length > 0) {
+      output += '\n\n' + warnings.join('\n');
+    }
+
+    return output;
+  }
+
+  private getEmbeddingsDisabledReason(reason: string): string {
+    switch (reason) {
+      case 'disabled_by_config': return 'Disabled (config)';
+      case 'extension_missing': return 'No sqlite-vec';
+      case 'model_missing': return 'Model not found';
+      case 'load_error': return 'Load failed';
+      default: return 'Disabled';
+    }
+  }
+
+  private formatUptime(ms: number): string {
+    const seconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const hours = Math.floor(minutes / 60);
+
+    if (hours > 0) {
+      return `${hours}h ${minutes % 60}m`;
+    }
+    if (minutes > 0) {
+      return `${minutes}m`;
+    }
+    return `${seconds}s`;
   }
 }
 

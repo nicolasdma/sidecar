@@ -29,5 +29,15 @@ Thumbs.db
 *.log
 npm-debug.log*
 
+# Planning docs (local only)
+docs/
+plan/
+CLAUDE.md
+PLAN.md
+HARDENING.md
+
+# Vendor binaries (platform-specific)
+vendor/
+
 # TypeScript cache
 *.tsbuildinfo

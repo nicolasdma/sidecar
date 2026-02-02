@@ -33,6 +33,7 @@ import { getMessageRouter } from '../../interfaces/message-router.js';
 import { initiateProactive } from '../brain.js';
 import type { NotificationMetadata } from '../../interfaces/types.js';
 import { createLogger } from '../../utils/logger.js';
+import { recordProactiveHeartbeat, recordProactiveMessage } from '../../utils/metrics.js';
 
 const logger = createLogger('spontaneous-loop');
 
@@ -132,6 +133,9 @@ function validateMessageType(
  */
 async function tick(): Promise<void> {
   if (!isRunning) return;
+
+  // Record heartbeat for health monitoring
+  recordProactiveHeartbeat();
 
   const tickId = Date.now().toString(36);
   logger.debug('Spontaneous loop tick', { tickId });
@@ -266,6 +270,7 @@ async function tick(): Promise<void> {
 
     if (sent) {
       recordSpontaneousMessageSent(decision.messageType, decision.message);
+      recordProactiveMessage(); // Centralized metrics
 
       if (decision.messageType === 'greeting') {
         const greetingWindow = context.isGreetingWindow;

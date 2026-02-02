@@ -20,8 +20,21 @@ import { createLogger } from '../utils/logger.js';
 import { getDecayStatus } from './decay-service.js';
 import { isEmbeddingsEnabled } from './embeddings-state.js';
 import { deleteFactVector } from './embeddings-loader.js';
+import { recordFactSaved } from '../utils/metrics.js';
 
 const logger = createLogger('facts-store');
+
+// Fase 3.6: Keywords that indicate potential contradictions
+const CONTRADICTION_INDICATORS = [
+  // Work-related
+  { keywords: ['trabajo', 'trabaj', 'empleo', 'empresa', 'company'], type: 'employment' },
+  // Location-related
+  { keywords: ['vivo', 'vive', 'ciudad', 'país', 'live', 'city'], type: 'location' },
+  // Relationship-related
+  { keywords: ['pareja', 'novio', 'novia', 'esposo', 'esposa', 'casado', 'soltero'], type: 'relationship' },
+  // Preference patterns
+  { keywords: ['prefiero', 'favorito', 'me gusta', 'odio', 'prefer', 'favorite'], type: 'preference' },
+];
 
 // ============= Type Definitions =============
 
@@ -137,8 +150,69 @@ export function saveFact(newFact: NewFact): string {
     }
   }
 
+  // Record metric for health monitoring
+  recordFactSaved();
+
+  // Fase 3.6: Check for potential contradictions
+  checkForContradictions(id, newFact);
+
   logger.info('Saved new fact', { id, domain: newFact.domain });
   return id;
+}
+
+/**
+ * Fase 3.6: Check if a new fact might contradict existing facts.
+ * Logs a warning if potential contradiction detected.
+ */
+function checkForContradictions(newFactId: string, newFact: NewFact): void {
+  const factLower = newFact.fact.toLowerCase();
+
+  // Find which contradiction type this fact might be
+  let contradictionType: string | null = null;
+  for (const indicator of CONTRADICTION_INDICATORS) {
+    if (indicator.keywords.some(kw => factLower.includes(kw))) {
+      contradictionType = indicator.type;
+      break;
+    }
+  }
+
+  if (!contradictionType) {
+    return; // No special contradiction checking needed
+  }
+
+  // Get existing facts in the same domain
+  const existingFacts = getFacts({
+    domain: newFact.domain,
+    includeStale: false,
+    includeArchived: false,
+  });
+
+  // Check for potential contradictions
+  for (const existing of existingFacts) {
+    if (existing.id === newFactId) continue;
+
+    const existingLower = existing.fact.toLowerCase();
+
+    // Check if existing fact is of the same type
+    const existingIsMatch = CONTRADICTION_INDICATORS
+      .find(i => i.type === contradictionType)
+      ?.keywords.some(kw => existingLower.includes(kw));
+
+    if (existingIsMatch) {
+      // Potential contradiction - same type of fact in same domain
+      logger.warn('Potential fact contradiction detected', {
+        newFact: newFact.fact.slice(0, 50),
+        existingFact: existing.fact.slice(0, 50),
+        existingId: existing.id,
+        domain: newFact.domain,
+        type: contradictionType,
+        suggestion: 'Consider using supersedeFact() to update the old fact',
+      });
+
+      // Only warn about first potential contradiction
+      break;
+    }
+  }
 }
 
 /**
@@ -222,6 +296,27 @@ export function markFactStale(id: string): void {
     logger.info('Marked fact as stale', { id });
   } else {
     logger.warn('Fact not found for stale marking', { id });
+  }
+}
+
+/**
+ * Archives a fact (soft delete).
+ * Archived facts are excluded from normal queries but can be retrieved
+ * with includeArchived: true.
+ */
+export function archiveFact(id: string): void {
+  const db = getDatabase();
+  const stmt = db.prepare(`
+    UPDATE facts
+    SET archived = 1
+    WHERE id = ?
+  `);
+  const result = stmt.run(id);
+
+  if (result.changes > 0) {
+    logger.info('Archived fact', { id });
+  } else {
+    logger.warn('Fact not found for archiving', { id });
   }
 }
 

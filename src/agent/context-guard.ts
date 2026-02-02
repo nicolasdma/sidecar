@@ -21,6 +21,7 @@ import { summarizeMessages } from '../memory/summarization-service.js';
 import { detectTopicShift, shouldTriggerSummarization } from '../memory/topic-detector.js';
 import { getAdaptiveWindowSize } from '../memory/semantic-continuity.js';
 import { isEmbeddingsReady } from '../memory/embeddings-state.js';
+import { recordContextTruncation } from '../utils/metrics.js';
 
 const logger = createLogger('context');
 
@@ -246,6 +247,9 @@ export async function truncateMessages(
       });
     }
   }
+
+  // Record truncation for health metrics
+  recordContextTruncation();
 
   return {
     messages: truncated,

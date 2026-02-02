@@ -10,6 +10,7 @@
 
 import { createLogger } from '../../utils/logger.js';
 import { classifyIntent, warmupClassifier, validateModel } from './classifier.js';
+import { getSystemStateJson, setSystemStateJson } from '../../memory/store.js';
 import { executeIntent } from './direct-executor.js';
 import type {
   Intent,
@@ -81,6 +82,65 @@ export class LocalRouter {
       backoffUntil: null,
       lastError: null,
     };
+
+    // Fase 3.6: Restore backoff state from persistence
+    this.restoreBackoffState();
+  }
+
+  /**
+   * Restore backoff state from SQLite (survives restarts).
+   */
+  private restoreBackoffState(): void {
+    try {
+      const persisted = getSystemStateJson<{
+        consecutiveFailures: number;
+        backoffUntil: number | null;
+        lastError: string | null;
+      }>('localrouter_backoff');
+
+      if (persisted) {
+        // Only restore if backoff is still valid
+        if (persisted.backoffUntil && persisted.backoffUntil > Date.now()) {
+          this.backoffState = {
+            consecutiveFailures: persisted.consecutiveFailures,
+            backoffUntil: persisted.backoffUntil,
+            lastError: persisted.lastError,
+          };
+          logger.info('Restored LocalRouter backoff state', {
+            failures: persisted.consecutiveFailures,
+            until: new Date(persisted.backoffUntil).toISOString(),
+          });
+        } else if (persisted.consecutiveFailures > 0) {
+          // Backoff expired but remember failure count
+          this.backoffState.consecutiveFailures = persisted.consecutiveFailures;
+          this.backoffState.lastError = persisted.lastError;
+          logger.debug('Restored LocalRouter failure count (backoff expired)', {
+            failures: persisted.consecutiveFailures,
+          });
+        }
+      }
+    } catch (error) {
+      logger.warn('Failed to restore LocalRouter backoff state', {
+        error: error instanceof Error ? error.message : 'Unknown',
+      });
+    }
+  }
+
+  /**
+   * Persist backoff state to SQLite.
+   */
+  private persistBackoffState(): void {
+    try {
+      setSystemStateJson('localrouter_backoff', {
+        consecutiveFailures: this.backoffState.consecutiveFailures,
+        backoffUntil: this.backoffState.backoffUntil,
+        lastError: this.backoffState.lastError,
+      });
+    } catch (error) {
+      logger.warn('Failed to persist LocalRouter backoff state', {
+        error: error instanceof Error ? error.message : 'Unknown',
+      });
+    }
   }
 
   /**
@@ -137,20 +197,31 @@ export class LocalRouter {
         until: new Date(this.backoffState.backoffUntil).toISOString(),
       });
     }
+
+    // Fase 3.6: Persist state for crash recovery
+    this.persistBackoffState();
   }
 
   /**
    * Record a success and reset failure counter.
    */
   private recordOllamaSuccess(): void {
-    if (this.backoffState.consecutiveFailures > 0) {
+    const hadFailures = this.backoffState.consecutiveFailures > 0;
+
+    if (hadFailures) {
       logger.info('LocalRouter recovered from failures', {
         previous_failures: this.backoffState.consecutiveFailures,
       });
     }
+
     this.backoffState.consecutiveFailures = 0;
     this.backoffState.backoffUntil = null;
     this.backoffState.lastError = null;
+
+    // Fase 3.6: Persist state for crash recovery (only if we had failures)
+    if (hadFailures) {
+      this.persistBackoffState();
+    }
   }
 
   /**

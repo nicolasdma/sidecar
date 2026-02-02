@@ -1,6 +1,6 @@
 import { startCLI } from './interfaces/cli.js';
 import { validateConfig, config } from './utils/config.js';
-import { closeDatabase } from './memory/store.js';
+import { closeDatabase, getPendingExtractionCount, getPendingEmbeddingCount } from './memory/store.js';
 import { createLogger } from './utils/logger.js';
 import { runDecayCheck } from './memory/decay-service.js';
 import { startExtractionWorker, stopExtractionWorker } from './memory/extraction-service.js';
@@ -12,43 +12,93 @@ import {
 import { startEmbeddingWorker, stopEmbeddingWorker } from './memory/embedding-worker.js';
 import { disposePipeline } from './memory/embeddings-model.js';
 import { initializeLocalRouter } from './agent/local-router/index.js';
+import { checkOllamaAvailability } from './llm/ollama.js';
+import { getTotalFactsCount } from './memory/facts-store.js';
 
 const logger = createLogger('main');
 
 /**
  * Logs startup status in a formatted box.
  * Shows user what features are active/inactive.
+ * Fase 3.6: Expanded dashboard for better visibility.
  */
-function logStartupStatus(embeddingsEnabled: boolean): void {
+async function logStartupStatus(
+  embeddingsEnabled: boolean,
+  localRouterReady: boolean
+): Promise<void> {
   const state = getEmbeddingsState();
 
-  const embedStatus = embeddingsEnabled
+  // Check Ollama availability
+  const ollamaStatus = await checkOllamaAvailability();
+
+  // Get queue sizes
+  const extractionQueue = getPendingExtractionCount();
+  const embeddingQueue = embeddingsEnabled ? getPendingEmbeddingCount() : 0;
+
+  // Get facts count
+  const factsCount = getTotalFactsCount();
+
+  // Status icons and labels
+  const ollamaLabel = ollamaStatus.available ? '✓ Connected' : '✗ Offline';
+  const embedLabel = embeddingsEnabled
     ? state.ready
       ? '✓ Active'
       : '◐ Loading...'
     : '✗ Disabled';
+  const routerLabel = localRouterReady
+    ? '✓ Ready'
+    : config.localRouter.enabled
+      ? '◐ Warming...'
+      : '○ Disabled';
+  const searchLabel = embeddingsEnabled ? '✓ Semantic' : '○ Keyword';
 
-  const vectorStatus = embeddingsEnabled ? '✓ Available' : '✗ Keyword only';
+  // Determine overall status
+  const hasIssues = !ollamaStatus.available || (!embeddingsEnabled && state.reason === 'extension_missing');
+  const overallStatus = hasIssues ? '◐ Degraded' : '✓ Ready';
 
-  const windowStatus = embeddingsEnabled ? '✓ Semantic' : '○ Fixed (6 turns)';
-
-  console.log('\n┌─────────────────────────────────┐');
-  console.log('│ Sidecar Status                  │');
-  console.log('├─────────────────────────────────┤');
-  console.log(`│ Embeddings:     ${embedStatus.padEnd(15)}│`);
-  console.log(`│ Vector Search:  ${vectorStatus.padEnd(15)}│`);
-  console.log(`│ Context Window: ${windowStatus.padEnd(15)}│`);
-  console.log('└─────────────────────────────────┘\n');
-
-  // Issue 1: Clear warning if sqlite-vec is missing
-  if (!embeddingsEnabled && state.reason === 'extension_missing') {
-    console.log('⚠️  SEMANTIC SEARCH DISABLED');
-    console.log('   Vector search requires sqlite-vec extension.');
-    console.log('   Install with: npm install sqlite-vec');
-    console.log('   Falling back to keyword search (Fase 2).\n');
-  } else if (!embeddingsEnabled && state.reason === 'disabled_by_config') {
-    console.log('ℹ️  Semantic search disabled by configuration (EMBEDDINGS_ENABLED=false)\n');
+  console.log('\n┌─────────────────────────────────────┐');
+  console.log(`│ Sidecar ${overallStatus.padEnd(28)}│`);
+  console.log('├─────────────────────────────────────┤');
+  console.log(`│ Ollama:         ${ollamaLabel.padEnd(20)}│`);
+  console.log(`│ Embeddings:     ${embedLabel.padEnd(20)}│`);
+  console.log(`│ LocalRouter:    ${routerLabel.padEnd(20)}│`);
+  console.log(`│ Search Mode:    ${searchLabel.padEnd(20)}│`);
+  console.log('├─────────────────────────────────────┤');
+  console.log(`│ Facts stored:   ${String(factsCount).padEnd(20)}│`);
+  console.log(`│ Extraction Q:   ${String(extractionQueue).padEnd(20)}│`);
+  if (embeddingsEnabled) {
+    console.log(`│ Embedding Q:    ${String(embeddingQueue).padEnd(20)}│`);
   }
+  console.log('└─────────────────────────────────────┘\n');
+
+  // Warnings
+  const warnings: string[] = [];
+
+  if (!ollamaStatus.available) {
+    warnings.push('⚠️  Ollama not available - fact extraction and LocalRouter disabled');
+    warnings.push('   Start Ollama with: ollama serve');
+  }
+
+  if (!embeddingsEnabled && state.reason === 'extension_missing') {
+    warnings.push('⚠️  Semantic search disabled (sqlite-vec not found)');
+    warnings.push('   Install with: npm install sqlite-vec');
+  } else if (!embeddingsEnabled && state.reason === 'disabled_by_config') {
+    warnings.push('ℹ️  Semantic search disabled by configuration');
+  }
+
+  if (extractionQueue > 50) {
+    warnings.push(`⚠️  Large extraction backlog: ${extractionQueue} items pending`);
+  }
+
+  if (embeddingQueue > 50) {
+    warnings.push(`⚠️  Large embedding backlog: ${embeddingQueue} items pending`);
+  }
+
+  if (warnings.length > 0) {
+    console.log(warnings.join('\n') + '\n');
+  }
+
+  console.log('Tip: Usá /health para ver el estado completo del sistema.\n');
 }
 
 async function main(): Promise<void> {
@@ -84,14 +134,13 @@ async function main(): Promise<void> {
     logger.warn('Embeddings initialization failed', { error });
   }
 
-  // Fase 3 Fixes: Log startup status with clear messaging
-  logStartupStatus(embeddingsEnabled);
-
   // Fase 3.5: Initialize and warm up LocalRouter
   // This loads Qwen2.5-3B into memory for faster first request
+  let localRouterReady = false;
   if (config.localRouter.enabled) {
     try {
       await initializeLocalRouter(config.localRouter, true);
+      localRouterReady = true;
       logger.info('LocalRouter initialized');
     } catch (error) {
       logger.warn('LocalRouter initialization failed, will retry on first request', {
@@ -101,6 +150,9 @@ async function main(): Promise<void> {
   } else {
     logger.debug('LocalRouter disabled');
   }
+
+  // Fase 3.6: Expanded startup status dashboard
+  await logStartupStatus(embeddingsEnabled, localRouterReady);
 
   process.on('SIGINT', async () => {
     console.log('\n\nRecibida señal de interrupción, cerrando...');

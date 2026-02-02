@@ -14,7 +14,9 @@
     "test:local-router": "vitest run tests/local-router/",
     "test:local-router:watch": "vitest tests/local-router/",
     "test:fase3": "npx tsx tests/fase-3-embeddings.test.ts",
-    "test:fase3:integration": "TEST_EMBEDDINGS=true npx tsx tests/fase-3-embeddings.test.ts"
+    "test:fase3:integration": "TEST_EMBEDDINGS=true npx tsx tests/fase-3-embeddings.test.ts",
+    "test:integration": "npx tsx tests/integration/memory-lifecycle.test.ts && npx tsx tests/integration/health-system.test.ts && npx tsx tests/integration/state-persistence.test.ts",
+    "test:all": "npm run test && npm run test:integration"
   },
   "keywords": [
     "ai",

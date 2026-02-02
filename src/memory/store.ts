@@ -7,7 +7,7 @@ import { createLogger } from '../utils/logger.js';
 const logger = createLogger('memory');
 
 // Current schema version (increment when adding new migrations)
-const CURRENT_SCHEMA_VERSION = 3;
+const CURRENT_SCHEMA_VERSION = 4;
 
 const SCHEMA = `
   -- Schema version tracking for migrations
@@ -153,6 +153,14 @@ const SCHEMA = `
     ON response_cache(fact_ids_hash, system_version);
   CREATE INDEX IF NOT EXISTS idx_response_cache_created
     ON response_cache(created_at);
+
+  -- Fase 3.6: System state persistence for crash recovery
+  -- Stores state that should survive restarts (backoff, circuit breakers, etc.)
+  CREATE TABLE IF NOT EXISTS system_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT DEFAULT (datetime('now'))
+  );
 `;
 
 /**
@@ -176,8 +184,18 @@ interface Migration {
  * Each migration runs once when version is greater than stored version.
  */
 const MIGRATIONS: Migration[] = [
-  // Future migrations go here, e.g.:
-  // { version: 4, name: 'add-embedding-metadata', sql: 'ALTER TABLE ...' },
+  // Fase 3.6: Add system_state table for crash recovery
+  {
+    version: 4,
+    name: 'add-system-state',
+    sql: `
+      CREATE TABLE IF NOT EXISTS system_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT DEFAULT (datetime('now'))
+      );
+    `,
+  },
 ];
 
 /**
@@ -1480,6 +1498,33 @@ export function deleteFactEmbedding(factId: string): boolean {
   return result.changes > 0;
 }
 
+/**
+ * Fase 3.6: Gets embedding version statistics for drift detection.
+ */
+export function getEmbeddingVersionStats(): { version: string; count: number }[] {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    SELECT model_version as version, COUNT(*) as count
+    FROM fact_embeddings
+    GROUP BY model_version
+    ORDER BY count DESC
+  `);
+  return stmt.all() as { version: string; count: number }[];
+}
+
+/**
+ * Fase 3.6: Counts embeddings with outdated model version.
+ */
+export function countOutdatedEmbeddings(currentVersion: string): number {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    SELECT COUNT(*) as count FROM fact_embeddings
+    WHERE model_version != ?
+  `);
+  const row = stmt.get(currentVersion) as { count: number };
+  return row.count;
+}
+
 // ============= Fase 3: Response Cache Functions =============
 
 export interface ResponseCacheRow {
@@ -1566,4 +1611,63 @@ export function clearResponseCache(): number {
     logger.info('Cleared response cache', { count: result.changes });
   }
   return result.changes;
+}
+
+// ============= Fase 3.6: System State Persistence =============
+
+/**
+ * Gets a value from the system state store.
+ * Returns null if the key doesn't exist.
+ */
+export function getSystemState(key: string): string | null {
+  const database = getDatabase();
+  const row = database.prepare(
+    'SELECT value FROM system_state WHERE key = ?'
+  ).get(key) as { value: string } | undefined;
+  return row?.value ?? null;
+}
+
+/**
+ * Gets a JSON value from the system state store.
+ * Returns null if the key doesn't exist or JSON is invalid.
+ */
+export function getSystemStateJson<T>(key: string): T | null {
+  const value = getSystemState(key);
+  if (!value) return null;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    logger.warn('Invalid JSON in system state', { key });
+    return null;
+  }
+}
+
+/**
+ * Sets a value in the system state store.
+ */
+export function setSystemState(key: string, value: string): void {
+  const database = getDatabase();
+  database.prepare(`
+    INSERT INTO system_state (key, value, updated_at)
+    VALUES (?, ?, datetime('now'))
+    ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = datetime('now')
+  `).run(key, value, value);
+}
+
+/**
+ * Sets a JSON value in the system state store.
+ */
+export function setSystemStateJson(key: string, value: unknown): void {
+  setSystemState(key, JSON.stringify(value));
+}
+
+/**
+ * Deletes a key from the system state store.
+ */
+export function deleteSystemState(key: string): boolean {
+  const database = getDatabase();
+  const result = database.prepare(
+    'DELETE FROM system_state WHERE key = ?'
+  ).run(key);
+  return result.changes > 0;
 }

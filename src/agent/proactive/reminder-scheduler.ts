@@ -22,6 +22,7 @@ import { recordReminderSent } from './state.js';
 import { getMessageRouter } from '../../interfaces/message-router.js';
 import type { NotificationMetadata } from '../../interfaces/types.js';
 import { createLogger } from '../../utils/logger.js';
+import { recordReminderHeartbeat, recordReminderSent as recordReminderMetric } from '../../utils/metrics.js';
 
 const logger = createLogger('reminder-scheduler');
 
@@ -69,6 +70,7 @@ async function processReminder(reminder: ReminderRow): Promise<boolean> {
       // Mark as delivered (status=2)
       markReminderTriggered(reminder.id, 2);
       recordReminderSent();
+      recordReminderMetric(); // Centralized metrics
 
       logger.info('Reminder delivered', { id: reminder.id });
       return true;
@@ -92,6 +94,9 @@ async function processReminder(reminder: ReminderRow): Promise<boolean> {
  */
 async function tick(): Promise<void> {
   if (!isRunning) return;
+
+  // Record heartbeat for health monitoring
+  recordReminderHeartbeat();
 
   logger.debug('Reminder scheduler tick');
 

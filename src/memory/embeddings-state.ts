@@ -9,7 +9,7 @@
 
 import { createLogger } from '../utils/logger.js';
 import { getEmbeddingsConfig } from '../config/embeddings-config.js';
-import { getDatabase } from './store.js';
+import { getDatabase, getSystemStateJson, setSystemStateJson } from './store.js';
 import { loadSqliteVec, createVectorIndex } from './embeddings-loader.js';
 
 const logger = createLogger('embeddings-state');
@@ -81,11 +81,68 @@ export function isEmbeddingsReady(): boolean {
 }
 
 /**
+ * Fase 3.6: Persist circuit breaker state to SQLite.
+ */
+function persistCircuitBreakerState(): void {
+  try {
+    setSystemStateJson('embeddings_circuit_breaker', {
+      consecutiveFailures: state.consecutiveFailures,
+      circuitOpenUntil: state.circuitOpenUntil,
+    });
+  } catch (error) {
+    logger.warn('Failed to persist embeddings circuit breaker state', {
+      error: error instanceof Error ? error.message : 'Unknown',
+    });
+  }
+}
+
+/**
+ * Fase 3.6: Restore circuit breaker state from SQLite.
+ */
+export function restoreCircuitBreakerState(): void {
+  try {
+    const persisted = getSystemStateJson<{
+      consecutiveFailures: number;
+      circuitOpenUntil: number | null;
+    }>('embeddings_circuit_breaker');
+
+    if (persisted) {
+      // Only restore if circuit is still open
+      if (persisted.circuitOpenUntil && persisted.circuitOpenUntil > Date.now()) {
+        state.consecutiveFailures = persisted.consecutiveFailures;
+        state.circuitOpenUntil = persisted.circuitOpenUntil;
+        state.reason = 'circuit_breaker';
+        logger.info('Restored embeddings circuit breaker state', {
+          failures: persisted.consecutiveFailures,
+          until: new Date(persisted.circuitOpenUntil).toISOString(),
+        });
+      } else if (persisted.consecutiveFailures > 0) {
+        // Circuit closed but remember failure count
+        state.consecutiveFailures = persisted.consecutiveFailures;
+        logger.debug('Restored embeddings failure count (circuit closed)', {
+          failures: persisted.consecutiveFailures,
+        });
+      }
+    }
+  } catch (error) {
+    logger.warn('Failed to restore embeddings circuit breaker state', {
+      error: error instanceof Error ? error.message : 'Unknown',
+    });
+  }
+}
+
+/**
  * Records a successful embedding operation.
  * Resets the failure counter.
  */
 export function recordEmbeddingSuccess(): void {
+  const hadFailures = state.consecutiveFailures > 0;
   state.consecutiveFailures = 0;
+
+  // Fase 3.6: Persist if we recovered from failures
+  if (hadFailures) {
+    persistCircuitBreakerState();
+  }
 }
 
 /**
@@ -104,6 +161,9 @@ export function recordEmbeddingFailure(): void {
       resetAt: new Date(state.circuitOpenUntil).toISOString(),
     });
   }
+
+  // Fase 3.6: Persist state for crash recovery
+  persistCircuitBreakerState();
 }
 
 /**
@@ -225,6 +285,10 @@ export async function initializeEmbeddings(): Promise<boolean> {
     reason: 'ok',
     lastCheck: Date.now(),
   };
+
+  // Fase 3.6: Restore circuit breaker state from previous session
+  restoreCircuitBreakerState();
+
   logger.info('Embeddings enabled (model will load on first use)', { source: loadResult.source });
   return true;
 }

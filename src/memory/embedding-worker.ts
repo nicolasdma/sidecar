@@ -10,6 +10,11 @@
 
 import { createLogger } from '../utils/logger.js';
 import { embedText, isModelReady } from './embeddings-model.js';
+import {
+  recordEmbeddingGenerated,
+  recordEmbeddingFailure as recordEmbeddingMetricFailure,
+  resetEmbeddingFailures,
+} from '../utils/metrics.js';
 import { isEmbeddingsEnabled, isEmbeddingsReady, recordEmbeddingSuccess, recordEmbeddingFailure } from './embeddings-state.js';
 import { serializeEmbedding } from './vector-math.js';
 import {
@@ -25,6 +30,8 @@ import {
   getFactsNeedingEmbedding,
   queueFactForEmbedding,
   cleanupExpiredCache,
+  countOutdatedEmbeddings,
+  getEmbeddingVersionStats,
   type PendingEmbeddingRow,
 } from './store.js';
 import { getFactById } from './facts-store.js';
@@ -42,6 +49,31 @@ const CACHE_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 let workerTimer: ReturnType<typeof setInterval> | null = null;
 let processingLock = false; // Mutex for queue processing
 let lastCacheCleanup = 0; // Track last cleanup time
+
+/**
+ * Fase 3.6: Check for embedding version drift and alert if detected.
+ */
+function checkEmbeddingVersionDrift(): void {
+  const outdated = countOutdatedEmbeddings(CURRENT_MODEL_VERSION);
+
+  if (outdated > 0) {
+    const stats = getEmbeddingVersionStats();
+    logger.warn('Embedding version drift detected', {
+      currentVersion: CURRENT_MODEL_VERSION,
+      outdatedCount: outdated,
+      versionDistribution: stats,
+      action: 'Outdated embeddings will be re-queued automatically',
+    });
+  } else {
+    const stats = getEmbeddingVersionStats();
+    if (stats.length > 0) {
+      logger.debug('Embedding versions consistent', {
+        version: CURRENT_MODEL_VERSION,
+        totalEmbeddings: stats[0]?.count ?? 0,
+      });
+    }
+  }
+}
 
 /**
  * Starts the embedding worker.
@@ -66,6 +98,9 @@ export async function startEmbeddingWorker(): Promise<void> {
 
   // Fix #4: Cleanup orphan vectors/embeddings for deleted facts
   cleanupOrphanVectors();
+
+  // Fase 3.6: Check for embedding version drift
+  checkEmbeddingVersionDrift();
 
   // Queue facts without embeddings
   await queueMissingEmbeddings();
@@ -185,12 +220,16 @@ async function processEmbeddingItem(item: PendingEmbeddingRow): Promise<void> {
 
     markEmbeddingCompleted(item.id);
     recordEmbeddingSuccess();
+    recordEmbeddingGenerated(); // Centralized metrics
+    resetEmbeddingFailures();
 
     logger.debug('Embedded fact', { factId: item.fact_id });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     markEmbeddingFailed(item.id, message);
     recordEmbeddingFailure();
+    recordEmbeddingMetricFailure(); // Centralized metrics
+
     logger.warn('Embedding failed', { factId: item.fact_id, error: message });
   }
 }

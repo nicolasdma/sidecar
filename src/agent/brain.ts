@@ -16,6 +16,12 @@ import { queueForExtraction } from '../memory/extraction-service.js';
 import { createLogger } from '../utils/logger.js';
 import { config } from '../utils/config.js';
 import { getLocalRouter, type LocalRouter } from './local-router/index.js';
+import {
+  recordMessageProcessed,
+  recordToolExecuted,
+  recordLocalRouterHit,
+  recordLocalRouterBypass,
+} from '../utils/metrics.js';
 
 const logger = createLogger('brain');
 
@@ -87,6 +93,12 @@ export class Brain {
 
     // Only undefined/null triggers proactive mode, not empty string
     const isProactiveMode = options.userInput == null;
+
+    // Record message for metrics (only reactive mode counts as user message)
+    if (!isProactiveMode) {
+      recordMessageProcessed();
+    }
+
     logger.debug('Starting new turn', {
       turnId: execContext.turnId,
       mode: isProactiveMode ? 'proactive' : 'reactive',
@@ -101,7 +113,18 @@ export class Brain {
       this.localRouter &&
       config.localRouter.enabled
     ) {
+      // Fase 3.6: Check if router is in backoff and alert user
+      const routerStats = this.localRouter.getStats();
+      if (routerStats.backoff?.inBackoff) {
+        logger.debug('LocalRouter in backoff, using LLM directly');
+      }
+
       const routingResult = await this.localRouter.tryRoute(options.userInput);
+
+      // Alert if routing was slow (likely due to Ollama issues)
+      if (routingResult.latencyMs && routingResult.latencyMs > 5000) {
+        console.log(`\n⏳ Nota: Hubo latencia en el routing (${(routingResult.latencyMs / 1000).toFixed(1)}s). Considerá verificar Ollama con /health.\n`);
+      }
 
       if (routingResult.route === 'DIRECT_TOOL') {
         const execResult = await this.localRouter.executeDirect(
@@ -113,6 +136,9 @@ export class Brain {
           // Save with SAME format as agentic loop
           this.saveDirectResponse(options.userInput, execResult.response);
 
+          // Record metrics
+          recordLocalRouterHit();
+
           logger.info('Direct execution successful', {
             intent: routingResult.intent,
             latency_ms: execResult.latencyMs,
@@ -123,6 +149,8 @@ export class Brain {
 
         // Tool failed -> fallback to Brain WITH CONTEXT
         this.localRouter.recordFallback();
+        recordLocalRouterBypass(); // Record fallback as bypass
+
         logger.warn('Direct execution failed, falling back to Brain', {
           intent: routingResult.intent,
           error: execResult.error,
@@ -130,9 +158,10 @@ export class Brain {
 
         // Continue to agentic loop - the message will be saved below
         // Note: We don't pass previous attempt context yet (could be added later)
+      } else {
+        // ROUTE_TO_LLM -> record bypass
+        recordLocalRouterBypass();
       }
-
-      // ROUTE_TO_LLM -> continue to agentic loop
     }
 
     // Issue #7: Only save user message if there's actual user input
@@ -157,7 +186,14 @@ export class Brain {
 
     // Issue #3: truncateMessages is now async to ensure backup completes
     // Fase 2: Pass current user message for topic shift detection
-    const { messages: truncatedHistory, backupFailed, topicShiftDetected } = await truncateMessages(
+    const {
+      messages: truncatedHistory,
+      truncated,
+      originalCount,
+      finalCount,
+      backupFailed,
+      topicShiftDetected,
+    } = await truncateMessages(
       history,
       this.maxContextTokens,
       options.userInput // Pass for topic shift detection
@@ -165,6 +201,16 @@ export class Brain {
 
     if (backupFailed) {
       logger.warn('Backup of truncated messages failed - potential data loss');
+    }
+
+    // Fase 3.6: Alert user when significant context truncation occurs
+    if (truncated && originalCount - finalCount > 2) {
+      logger.info('Context truncated', {
+        removed: originalCount - finalCount,
+        remaining: finalCount,
+      });
+      // User-visible alert (will appear before response)
+      console.log(`\n💡 Nota: Se resumió parte de la conversación anterior (${originalCount - finalCount} mensajes) para mantener el contexto manejable.\n`);
     }
 
     if (topicShiftDetected) {
@@ -236,6 +282,7 @@ export class Brain {
             const args = JSON.parse(toolCall.function.arguments) as Record<string, unknown>;
             // Issue #1: Pass execution context to tools
             result = await executeTool(toolCall.function.name, args, execContext);
+            recordToolExecuted(); // Centralized metrics
           } catch (parseError) {
             logger.error('Failed to parse tool arguments', toolCall.function.arguments);
             result = {
