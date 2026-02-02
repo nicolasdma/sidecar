@@ -45,6 +45,21 @@ import {
   type SubsystemHealth,
   type HealthStatus,
 } from '../utils/metrics.js';
+import {
+  getMCPClientManager,
+  loadMCPConfig,
+  saveMCPConfig,
+} from '../mcp/index.js';
+import {
+  getDeviceCapabilities,
+  getDeviceProfile,
+  getRouterMetrics,
+  getMetricsSummary,
+  getTierDescription,
+  getOllamaHealthMonitor,
+  resetSetupState,
+  ensureModelsInstalled,
+} from '../device/index.js';
 
 /**
  * Parse duration string like "1h", "30m", "2h".
@@ -128,6 +143,12 @@ export class DefaultCommandHandler implements CommandHandler {
       case 'health':
         return this.handleHealth();
 
+      case 'mcp':
+        return this.handleMCP(args);
+
+      case 'reset-models':
+        return this.handleResetModels();
+
       default:
         return null; // Not handled - pass to LLM
     }
@@ -158,6 +179,12 @@ Comandos disponibles:
                      schedule, goals, general, all
   /router-stats    - Ver estadísticas del LocalRouter
   /health          - Ver estado de salud del sistema
+  /mcp             - Ver estado de servidores MCP
+  /mcp enable <id> - Conectar servidor MCP (hot-reload)
+  /mcp disable <id>- Desconectar servidor MCP
+  /mcp tools <id>  - Listar tools de un servidor
+  /mcp reload [id] - Reconectar servidor(es)
+  /reset-models    - Reinstalar modelos esenciales de Ollama
   /exit            - Salir del programa
   /help            - Mostrar esta ayuda
 `;
@@ -420,6 +447,13 @@ O usá /facts sin argumentos para ver el resumen.`;
     const stats = router.getStats();
     const config = router.getConfig();
 
+    // Get device info (Fase 3.6a)
+    const capabilities = getDeviceCapabilities();
+    const profile = getDeviceProfile();
+    const v2Metrics = getRouterMetrics();
+    const summary = getMetricsSummary();
+
+    // Classic LocalRouter stats
     const localPct =
       stats.totalRequests > 0
         ? ((stats.routedLocal / stats.totalRequests) * 100).toFixed(1)
@@ -437,27 +471,44 @@ O usá /facts sin argumentos para ver el resumen.`;
         : '0.0';
 
     let output = `
-┌─────────────────────────────────────┐
-│ LocalRouter Statistics              │
-├─────────────────────────────────────┤
-│ Enabled:         ${(config.enabled ? 'Yes' : 'No').padEnd(18)}│
-│ Total requests:  ${String(stats.totalRequests).padEnd(18)}│
-│ Routed local:    ${`${stats.routedLocal} (${localPct}%)`.padEnd(18)}│
-│ Routed to LLM:   ${`${stats.routedToLlm} (${llmPct}%)`.padEnd(18)}│
-├─────────────────────────────────────┤
-│ Direct success:  ${String(stats.directSuccess).padEnd(18)}│
-│ Direct failures: ${String(stats.directFailures).padEnd(18)}│
-│ Success rate:    ${`${successRate}%`.padEnd(18)}│
-│ Fallbacks:       ${String(stats.fallbacksToBrain).padEnd(18)}│
-│ Avg latency:     ${`${stats.avgLocalLatencyMs.toFixed(0)}ms`.padEnd(18)}│`;
+┌─────────────────────────────────────────────────────────────┐
+│ Smart Router Stats                                           │`;
+
+    // Add device info if available (Fase 3.6a)
+    if (capabilities && profile) {
+      const monitor = getOllamaHealthMonitor();
+      const ollamaStatus = monitor.isAvailable() ? 'Available' : 'Not available';
+      output += `
+├─────────────────────────────────────────────────────────────┤
+│ Device: ${capabilities.os} ${capabilities.cpu} (${capabilities.ram}GB RAM)`.padEnd(62) + `│
+│ Tier: ${profile.tier} (${getTierDescription(profile.tier)})`.padEnd(62) + `│
+│ Disk Free: ${capabilities.diskFree}GB`.padEnd(62) + `│
+│ Classifier: ${profile.classifierModel}`.padEnd(62) + `│
+│ Ollama: ${ollamaStatus}`.padEnd(62) + `│`;
+    }
+
+    output += `
+├─────────────────────────────────────────────────────────────┤
+│ LocalRouter (Fase 3.5)                                       │
+├─────────────────────────────────────────────────────────────┤
+│ Enabled:         ${(config.enabled ? 'Yes' : 'No').padEnd(42)}│
+│ Total requests:  ${String(stats.totalRequests).padEnd(42)}│
+│ Routed local:    ${`${stats.routedLocal} (${localPct}%)`.padEnd(42)}│
+│ Routed to LLM:   ${`${stats.routedToLlm} (${llmPct}%)`.padEnd(42)}│
+├─────────────────────────────────────────────────────────────┤
+│ Direct success:  ${String(stats.directSuccess).padEnd(42)}│
+│ Direct failures: ${String(stats.directFailures).padEnd(42)}│
+│ Success rate:    ${`${successRate}%`.padEnd(42)}│
+│ Fallbacks:       ${String(stats.fallbacksToBrain).padEnd(42)}│
+│ Avg latency:     ${`${stats.avgLocalLatencyMs.toFixed(0)}ms`.padEnd(42)}│`;
 
     // Add backoff info if available
     if (stats.backoff) {
       output += `
-├─────────────────────────────────────┤
-│ Backoff State                       │
-│ In backoff:      ${(stats.backoff.inBackoff ? 'Yes' : 'No').padEnd(18)}│
-│ Failures:        ${String(stats.backoff.consecutiveFailures).padEnd(18)}│`;
+├─────────────────────────────────────────────────────────────┤
+│ Backoff State                                                │
+│ In backoff:      ${(stats.backoff.inBackoff ? 'Yes' : 'No').padEnd(42)}│
+│ Failures:        ${String(stats.backoff.consecutiveFailures).padEnd(42)}│`;
 
       if (stats.backoff.backoffUntil) {
         const until = stats.backoff.backoffUntil.toLocaleTimeString('es-AR', {
@@ -466,18 +517,54 @@ O usá /facts sin argumentos para ver el resumen.`;
           second: '2-digit',
         });
         output += `
-│ Until:           ${until.padEnd(18)}│`;
+│ Until:           ${until.padEnd(42)}│`;
       }
 
       if (stats.backoff.lastError) {
-        const truncatedError = stats.backoff.lastError.slice(0, 15);
+        const truncatedError = stats.backoff.lastError.slice(0, 38);
         output += `
-│ Last error:      ${truncatedError.padEnd(18)}│`;
+│ Last error:      ${truncatedError.padEnd(42)}│`;
+      }
+    }
+
+    // Add Router v2 metrics if available (Fase 3.6a)
+    if (v2Metrics.requestsTotal > 0) {
+      output += `
+├─────────────────────────────────────────────────────────────┤
+│ Router v2 (Fase 3.6a)                                        │
+├─────────────────────────────────────────────────────────────┤
+│ Total:           ${String(v2Metrics.requestsTotal).padEnd(42)}│
+│ Deterministic:   ${`${v2Metrics.requestsDeterministic} (${summary.deterministicPercentage}%)`.padEnd(42)}│
+│ Local LLM:       ${`${v2Metrics.requestsLocal} (${summary.localPercentage}%)`.padEnd(42)}│
+│ API:             ${`${v2Metrics.requestsApi} (${summary.apiPercentage}%)`.padEnd(42)}│
+├─────────────────────────────────────────────────────────────┤
+│ Fallback rate:   ${`${summary.fallbackRate}%`.padEnd(42)}│
+│ Est. savings:    ${summary.estimatedSavings.padEnd(42)}│
+├─────────────────────────────────────────────────────────────┤
+│ Health                                                       │
+│ Reconnects:      ${String(v2Metrics.ollamaReconnects).padEnd(42)}│
+│ Memory pressure: ${String(v2Metrics.memoryPressureEvents).padEnd(42)}│`;
+
+      // Top intents breakdown
+      const topIntents = Object.entries(v2Metrics.intentBreakdown)
+        .sort((a, b) => b[1].count - a[1].count)
+        .slice(0, 5);
+
+      if (topIntents.length > 0) {
+        output += `
+├─────────────────────────────────────────────────────────────┤
+│ Top Intents                                                  │`;
+        for (const [intent, data] of topIntents) {
+          const successPct = (data.successRate * 100).toFixed(0);
+          const info = `${data.count} (${successPct}% success, ${data.avgLatency}ms)`;
+          output += `
+│   ${intent.padEnd(16)} ${info.padEnd(40)}│`;
+        }
       }
     }
 
     output += `
-└─────────────────────────────────────┘`;
+└─────────────────────────────────────────────────────────────┘`;
 
     return output;
   }
@@ -626,6 +713,235 @@ O usá /facts sin argumentos para ver el resumen.`;
       return `${minutes}m`;
     }
     return `${seconds}s`;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // MODEL RESET COMMAND
+  // ═══════════════════════════════════════════════════════════════════
+
+  private async handleResetModels(): Promise<string> {
+    const profile = getDeviceProfile();
+
+    if (!profile) {
+      return 'Error: Device module no inicializado. Reiniciá la aplicación.';
+    }
+
+    if (profile.tier === 'minimal') {
+      return 'Tier minimal no requiere modelos locales.';
+    }
+
+    // Reset the setup state
+    resetSetupState();
+
+    // Run model setup again
+    console.log('\n');
+    const result = await ensureModelsInstalled(profile.tier, false);
+
+    if (result.skipped && result.success) {
+      return 'Todos los modelos ya están instalados.';
+    }
+
+    if (result.success) {
+      return `Modelos reinstalados correctamente: ${result.modelsInstalled.join(', ')}`;
+    }
+
+    return `Algunos modelos fallaron: ${result.modelsFailed.join(', ')}\nReintentá con: ollama pull <modelo>`;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // MCP COMMAND HANDLER
+  // ═══════════════════════════════════════════════════════════════════
+
+  private async handleMCP(args: string): Promise<string> {
+    const parts = args.trim().split(/\s+/);
+    const subcommand = parts[0]?.toLowerCase();
+    const serverId = parts[1];
+
+    const mcpManager = getMCPClientManager();
+
+    switch (subcommand) {
+      case undefined:
+      case '':
+      case 'list':
+        return this.formatMCPServerList();
+
+      case 'enable': {
+        if (!serverId) return 'Uso: /mcp enable <server-id>';
+
+        const config = await loadMCPConfig();
+        const serverConfig = config.servers.find((s) => s.id === serverId);
+
+        if (!serverConfig) {
+          return `Server "${serverId}" no encontrado en mcp-config.json`;
+        }
+
+        serverConfig.enabled = true;
+        await saveMCPConfig(config);
+
+        try {
+          await mcpManager.connectServer(serverConfig);
+          const status = mcpManager.getServerStatus(serverId);
+          return `${serverConfig.name} conectado. ${status.toolCount} tools disponibles.`;
+        } catch (error) {
+          const errMsg = error instanceof Error ? error.message : String(error);
+          return `Error conectando ${serverId}: ${errMsg}`;
+        }
+      }
+
+      case 'disable': {
+        if (!serverId) return 'Uso: /mcp disable <server-id>';
+
+        await mcpManager.disconnectServer(serverId);
+
+        const config = await loadMCPConfig();
+        const serverConfig = config.servers.find((s) => s.id === serverId);
+        if (serverConfig) {
+          serverConfig.enabled = false;
+          await saveMCPConfig(config);
+        }
+
+        return `${serverId} desconectado.`;
+      }
+
+      case 'status': {
+        if (!serverId) return 'Uso: /mcp status <server-id>';
+        return this.formatMCPServerStatus(serverId);
+      }
+
+      case 'tools': {
+        if (!serverId) return 'Uso: /mcp tools <server-id>';
+        return this.formatMCPServerTools(serverId);
+      }
+
+      case 'reload': {
+        if (serverId) {
+          try {
+            await mcpManager.reconnectServer(serverId);
+            return `${serverId} reconectado.`;
+          } catch (error) {
+            const errMsg = error instanceof Error ? error.message : String(error);
+            return `Error reconectando ${serverId}: ${errMsg}`;
+          }
+        } else {
+          // Reload all
+          const result = await mcpManager.initialize();
+          return (
+            `Reconectados: ${result.successful.join(', ') || '(ninguno)'}\n` +
+            `Fallidos: ${result.failed.map((f) => `${f.id}: ${f.error}`).join(', ') || '(ninguno)'}`
+          );
+        }
+      }
+
+      default:
+        return `Subcomando desconocido: "${subcommand}".\n` +
+          `Uso: /mcp [list|enable|disable|status|tools|reload] [server-id]`;
+    }
+  }
+
+  private async formatMCPServerList(): Promise<string> {
+    const mcpManager = getMCPClientManager();
+    const config = await loadMCPConfig();
+    const connectedServers = mcpManager.getConnectedServers();
+
+    // Create lookup for connected servers
+    const connectedMap = new Map(
+      connectedServers.map((s) => [s.id, s])
+    );
+
+    // Calculate total MCP tools
+    let totalTools = 0;
+    let totalPending = 0;
+    for (const server of connectedServers) {
+      totalTools += server.status.toolCount;
+      totalPending += server.status.pendingCalls;
+    }
+
+    let output = `
+┌─────────────────────────────────────────────────────────────┐
+│  MCP Servers                                                 │
+├─────────────────────────────────────────────────────────────┤
+│  Status   Name         Tools  Health   Last Ping             │
+│  ──────   ────         ─────  ──────   ─────────             │`;
+
+    for (const serverConfig of config.servers) {
+      const connected = connectedMap.get(serverConfig.id);
+
+      if (connected) {
+        const healthIcon = connected.status.healthy ? 'OK' : 'FAIL';
+        const pingTime = connected.status.lastPing
+          ? this.formatTimeSince(connected.status.lastPing)
+          : '-';
+        output += `\n│  ✓        ${serverConfig.name.padEnd(12)} ${String(connected.status.toolCount).padEnd(6)} ${healthIcon.padEnd(8)} ${pingTime.padEnd(18)}│`;
+      } else if (serverConfig.enabled) {
+        output += `\n│  ◐        ${serverConfig.name.padEnd(12)} -      -        (connecting)        │`;
+      } else {
+        output += `\n│  ○        ${serverConfig.name.padEnd(12)} -      -        (disabled)          │`;
+      }
+    }
+
+    output += `
+├─────────────────────────────────────────────────────────────┤
+│  Total tools MCP: ${String(totalTools).padEnd(4)} | Calls pendientes: ${String(totalPending).padEnd(14)}│
+└─────────────────────────────────────────────────────────────┘`;
+
+    return output;
+  }
+
+  private formatMCPServerStatus(serverId: string): string {
+    const mcpManager = getMCPClientManager();
+    const status = mcpManager.getServerStatus(serverId);
+
+    const statusLabel = status.connected ? 'Connected' : 'Disconnected';
+    const healthLabel = status.healthy ? 'OK' : 'FAIL';
+    const lastPing = status.lastPing
+      ? status.lastPing.toLocaleString('es-AR')
+      : '(never)';
+    const lastError = status.lastError ?? '(none)';
+
+    return `
+${serverId} MCP Server
+  Status:     ${statusLabel}
+  Health:     ${healthLabel}
+  Tools:      ${status.toolCount}
+  Last Ping:  ${lastPing}
+  Last Error: ${lastError}
+  Pending:    ${status.pendingCalls} calls
+  Reconnects: ${status.reconnectAttempts}`;
+  }
+
+  private async formatMCPServerTools(serverId: string): Promise<string> {
+    const mcpManager = getMCPClientManager();
+    const status = mcpManager.getServerStatus(serverId);
+
+    if (!status.connected) {
+      return `Server "${serverId}" no está conectado.`;
+    }
+
+    const allTools = await mcpManager.getAllTools();
+    const serverTools = allTools.filter((t) => t._mcpServerId === serverId);
+
+    if (serverTools.length === 0) {
+      return `Server "${serverId}" no tiene tools disponibles.`;
+    }
+
+    let output = `Tools from ${serverId} MCP Server:\n`;
+    for (const tool of serverTools) {
+      const desc = tool.description
+        ? ` - ${tool.description.slice(0, 50)}${tool.description.length > 50 ? '...' : ''}`
+        : '';
+      output += `  • ${tool.name}${desc}\n`;
+    }
+
+    return output;
+  }
+
+  private formatTimeSince(date: Date): string {
+    const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
+    if (seconds < 60) return `hace ${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `hace ${minutes}m`;
+    const hours = Math.floor(minutes / 60);
+    return `hace ${hours}h`;
   }
 }
 

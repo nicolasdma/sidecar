@@ -3,7 +3,7 @@ import { createKimiClient } from '../llm/kimi.js';
 import { buildSystemPrompt } from './prompt-builder.js';
 import { truncateMessages } from './context-guard.js';
 import {
-  getToolDefinitions,
+  getToolDefinitionsWithMCP,
   executeTool,
   initializeTools,
   createExecutionContext,
@@ -17,11 +17,26 @@ import { createLogger } from '../utils/logger.js';
 import { config } from '../utils/config.js';
 import { getLocalRouter, type LocalRouter } from './local-router/index.js';
 import {
+  routeV2,
+  isRouterV2Initialized,
+  isLikelySimpleChat,
+} from './local-router/router-v2.js';
+import { executeLocalIntent } from './local-router/local-executor.js';
+import {
+  executeProductivityTool,
+  formatProductivityResult,
+  isProductivityIntent,
+} from '../tools/productivity/index.js';
+import {
   recordMessageProcessed,
   recordToolExecuted,
   recordLocalRouterHit,
   recordLocalRouterBypass,
 } from '../utils/metrics.js';
+import {
+  recordLocalRequest,
+  recordLocalToApiFallback,
+} from '../device/metrics.js';
 
 const logger = createLogger('brain');
 
@@ -195,6 +210,87 @@ export class Brain {
       }
     }
 
+    // Fase 3.6b: Productivity tools via Router v2
+    // Try local LLM for translate, grammar_check, summarize, explain, simple_chat
+    if (
+      !isProactiveMode &&
+      options.userInput &&
+      isRouterV2Initialized()
+    ) {
+      const v2Result = await routeV2(options.userInput);
+
+      // Only process if tier is 'local' (not deterministic - already handled above)
+      if (v2Result.tier === 'local' && v2Result.model) {
+        const intent = v2Result.intent as string;
+
+        // Check if it's a productivity intent
+        if (isProductivityIntent(intent)) {
+          logger.info('Routing to productivity tool', {
+            intent,
+            model: v2Result.model,
+            confidence: v2Result.confidence,
+          });
+
+          const toolResult = await executeProductivityTool(
+            intent,
+            options.userInput,
+            v2Result.model,
+            v2Result.params
+          );
+
+          if (toolResult.success) {
+            const response = formatProductivityResult(intent, toolResult);
+
+            // Save with same format as agentic loop
+            this.saveDirectResponse(options.userInput, response);
+
+            // Record metrics (tokensGenerated not tracked for productivity tools)
+            recordLocalRequest(intent, toolResult.latencyMs, 0, true);
+
+            logger.info('Productivity tool execution successful', {
+              intent,
+              model: v2Result.model,
+              latencyMs: toolResult.latencyMs,
+            });
+
+            return response;
+          }
+
+          // Productivity tool failed -> fallback to API
+          logger.warn('Productivity tool failed, falling back to API', {
+            intent,
+            error: toolResult.error,
+          });
+          recordLocalToApiFallback(intent);
+          // Continue to agentic loop
+        } else if (intent === 'simple_chat') {
+          // Handle simple chat with local model (greetings, thanks, etc.)
+          if (isLikelySimpleChat(options.userInput)) {
+            logger.info('Routing to simple chat', {
+              model: v2Result.model,
+            });
+
+            const chatResult = await executeLocalIntent(
+              'simple_chat',
+              options.userInput,
+              v2Result.model
+            );
+
+            if (chatResult.success && chatResult.response) {
+              this.saveDirectResponse(options.userInput, chatResult.response);
+              recordLocalRequest('simple_chat', chatResult.latencyMs, chatResult.tokensGenerated || 0, true);
+
+              return chatResult.response;
+            }
+
+            // Simple chat failed, continue to agentic loop
+            logger.debug('Simple chat failed, falling back to API');
+            recordLocalToApiFallback('simple_chat');
+          }
+        }
+      }
+    }
+
     // Issue #7: Only save user message if there's actual user input
     let lastMessageId: number | null = null;
     if (options.userInput) {
@@ -249,7 +345,7 @@ export class Brain {
     }
 
     const systemPrompt = await buildSystemPrompt();
-    const tools = getToolDefinitions();
+    const tools = await getToolDefinitionsWithMCP();
 
     // Issue #7: For proactive mode, add context as a system-style message
     let workingMessages: Message[] = [...truncatedHistory];

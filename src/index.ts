@@ -14,7 +14,10 @@ import { startEmbeddingWorker, stopEmbeddingWorker } from './memory/embedding-wo
 import { disposePipeline } from './memory/embeddings-model.js';
 import { initializeLocalRouter } from './agent/local-router/index.js';
 import { checkOllamaAvailability } from './llm/ollama.js';
+import { initializeDevice, shutdownDevice } from './device/index.js';
+import { initializeRouterV2 } from './agent/local-router/router-v2.js';
 import { getTotalFactsCount } from './memory/facts-store.js';
+import { getMCPClientManager, type MCPInitializeResult } from './mcp/index.js';
 
 const logger = createLogger('main');
 
@@ -62,7 +65,8 @@ function validateStartupRequirements(): string[] {
  */
 async function logStartupStatus(
   embeddingsEnabled: boolean,
-  localRouterReady: boolean
+  localRouterReady: boolean,
+  mcpResult?: MCPInitializeResult
 ): Promise<void> {
   const state = getEmbeddingsState();
 
@@ -91,6 +95,15 @@ async function logStartupStatus(
       : '○ Disabled';
   const searchLabel = embeddingsEnabled ? '✓ Semantic' : '○ Keyword';
 
+  // MCP status
+  const mcpConnected = mcpResult?.successful.length ?? 0;
+  const mcpFailed = mcpResult?.failed.length ?? 0;
+  const mcpLabel = mcpConnected > 0
+    ? `✓ ${mcpConnected} server${mcpConnected > 1 ? 's' : ''}`
+    : mcpFailed > 0
+      ? `◐ ${mcpFailed} failed`
+      : '○ None enabled';
+
   // Determine overall status
   const hasIssues = !ollamaStatus.available || (!embeddingsEnabled && state.reason === 'extension_missing');
   const overallStatus = hasIssues ? '◐ Degraded' : '✓ Ready';
@@ -101,6 +114,7 @@ async function logStartupStatus(
   console.log(`│ Ollama:         ${ollamaLabel.padEnd(20)}│`);
   console.log(`│ Embeddings:     ${embedLabel.padEnd(20)}│`);
   console.log(`│ LocalRouter:    ${routerLabel.padEnd(20)}│`);
+  console.log(`│ MCP Servers:    ${mcpLabel.padEnd(20)}│`);
   console.log(`│ Search Mode:    ${searchLabel.padEnd(20)}│`);
   console.log('├─────────────────────────────────────┤');
   console.log(`│ Facts stored:   ${String(factsCount).padEnd(20)}│`);
@@ -116,6 +130,12 @@ async function logStartupStatus(
   if (!ollamaStatus.available) {
     warnings.push('⚠️  Ollama not available - fact extraction and LocalRouter disabled');
     warnings.push('   Start Ollama with: ollama serve');
+  }
+
+  if (mcpResult && mcpResult.failed.length > 0) {
+    for (const fail of mcpResult.failed) {
+      warnings.push(`⚠️  MCP server "${fail.id}" failed: ${fail.error}`);
+    }
   }
 
   if (!embeddingsEnabled && state.reason === 'extension_missing') {
@@ -196,13 +216,50 @@ async function main(): Promise<void> {
     logger.debug('LocalRouter disabled');
   }
 
+  // Fase 3.6a: Initialize device module and Router v2
+  // This enables local LLM productivity tools (translate, summarize, etc.)
+  try {
+    const deviceResult = await initializeDevice();
+    const profile = deviceResult.profile;
+
+    // Initialize Router v2 with device profile
+    initializeRouterV2(profile);
+
+    logger.info('Device module initialized', {
+      tier: profile.tier,
+      ollamaAvailable: deviceResult.ollamaHealth.available,
+      modelsAvailable: deviceResult.ollamaHealth.modelsAvailable.length,
+    });
+  } catch (error) {
+    logger.warn('Device module initialization failed', {
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+    // Non-fatal: continue without device features (productivity tools will fallback to API)
+  }
+
+  // Fase 3.6c: Initialize MCP servers (parallel, non-blocking)
+  let mcpResult: MCPInitializeResult | undefined;
+  try {
+    const mcpManager = getMCPClientManager();
+    mcpResult = await mcpManager.initialize();
+    if (mcpResult.successful.length > 0) {
+      logger.info(`MCP: ${mcpResult.successful.length} server(s) connected`);
+    }
+  } catch (error) {
+    logger.warn('MCP initialization failed', {
+      error: error instanceof Error ? error.message : error,
+    });
+  }
+
   // Fase 3.6: Expanded startup status dashboard
-  await logStartupStatus(embeddingsEnabled, localRouterReady);
+  await logStartupStatus(embeddingsEnabled, localRouterReady, mcpResult);
 
   process.on('SIGINT', async () => {
     console.log('\n\nRecibida señal de interrupción, cerrando...');
     stopEmbeddingWorker();
     stopExtractionWorker();
+    shutdownDevice(); // Fase 3.6a: Shutdown device module
+    await getMCPClientManager().shutdown(); // Close MCP servers
     await disposePipeline(); // Free embedding model memory
     closeDatabase();
     process.exit(0);
@@ -212,6 +269,8 @@ async function main(): Promise<void> {
     logger.info('Received SIGTERM, shutting down...');
     stopEmbeddingWorker();
     stopExtractionWorker();
+    shutdownDevice(); // Fase 3.6a: Shutdown device module
+    await getMCPClientManager().shutdown(); // Close MCP servers
     await disposePipeline(); // Free embedding model memory
     closeDatabase();
     process.exit(0);
@@ -221,6 +280,8 @@ async function main(): Promise<void> {
     logger.error('Uncaught exception', error);
     stopEmbeddingWorker();
     stopExtractionWorker();
+    shutdownDevice(); // Fase 3.6a: Shutdown device module
+    await getMCPClientManager().shutdown(); // Close MCP servers
     await disposePipeline(); // Free embedding model memory
     closeDatabase();
     process.exit(1);
