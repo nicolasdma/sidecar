@@ -6,7 +6,7 @@
  * 2. Local LLM (~2-5s, $0): Local model processing (translate, grammar, summarize)
  * 3. API (~1-3s, $$): Cloud LLM for complex tasks
  *
- * OPTIMIZATION: Fast-path regex patterns skip LLM classification for obvious intents.
+ * OPTIMIZATION: Keyword-based fast-path with normalization for robust intent detection.
  */
 
 import { createLogger } from '../../utils/logger.js';
@@ -20,7 +20,6 @@ import {
   RouterV2Decision,
   ExtendedIntent,
   LocalLLMIntent,
-  RoutingTier,
   LOCAL_LLM_INTENTS,
   DETERMINISTIC_INTENTS,
   INTENT_MODEL_PREFERENCES,
@@ -28,162 +27,24 @@ import {
   LOCAL_LLM_CONFIDENCE_THRESHOLDS,
   LOCAL_INTENT_VALIDATIONS,
 } from './types-v2.js';
+import { tryFastPath as keywordFastPath } from './fast-path.js';
 
 const logger = createLogger('router-v2');
 
 /**
- * Fast-path patterns for common intents.
- * These skip LLM classification entirely, saving 1-5 seconds per request.
- * Order matters: more specific patterns should come first.
- */
-interface FastPathRule {
-  pattern: RegExp;
-  intent: ExtendedIntent;
-  tier: RoutingTier;
-  confidence: number;
-  extractParams?: (input: string) => Record<string, string> | undefined;
-}
-
-const FAST_PATH_RULES: FastPathRule[] = [
-  // Translation - high priority, very common
-  {
-    pattern: /\b(traduc[eíi]r?|translate|traducción|traducime|traduzca)\b/i,
-    intent: 'translate',
-    tier: 'local',
-    confidence: 0.95,
-    extractParams: (input) => {
-      // Try to extract target language
-      const langMatch = input.match(/\b(al?|to|en)\s+(español|english|inglés|francés|french|portugués|portuguese|alemán|german|italiano|italian)\b/i);
-      if (langMatch && langMatch[2]) {
-        const langMap: Record<string, string> = {
-          español: 'es', spanish: 'es',
-          english: 'en', inglés: 'en',
-          francés: 'fr', french: 'fr',
-          portugués: 'pt', portuguese: 'pt',
-          alemán: 'de', german: 'de',
-          italiano: 'it', italian: 'it',
-        };
-        const lang = langMap[langMatch[2].toLowerCase()] || langMatch[2];
-        return { targetLang: lang };
-      }
-      return undefined;
-    },
-  },
-  // Time queries
-  {
-    pattern: /\b(qué hora|what time|hora actual|current time|qué día|what day|fecha actual|today'?s date)\b/i,
-    intent: 'time',
-    tier: 'deterministic',
-    confidence: 0.98,
-  },
-  // Weather queries
-  {
-    pattern: /\b(clima|weather|temperatura|temperature|va a llover|will it rain|lluvia|rain|necesito paraguas|need umbrella|hace (fr[ií]o|calor))\b/i,
-    intent: 'weather',
-    tier: 'deterministic',
-    confidence: 0.95,
-    extractParams: (input) => {
-      // Try to extract location: "clima en X", "weather in X"
-      const locationMatch = input.match(/\b(clima|weather|temperatura)\s+(en|in|de|for)\s+([^,?.!]+)/i);
-      if (locationMatch && locationMatch[3]) {
-        return { location: locationMatch[3].trim() };
-      }
-      return undefined;
-    },
-  },
-  // List reminders
-  {
-    pattern: /\b(mis recordatorios|my reminders|listar? recordatorios|list reminders|qué tengo pendiente|recordatorios activos)\b/i,
-    intent: 'list_reminders',
-    tier: 'deterministic',
-    confidence: 0.98,
-  },
-  // Cancel reminder (be careful: needs to be specific, not mass action)
-  {
-    pattern: /\b(cancel[ae]r?|borrar?|eliminar?)\s+(el\s+)?recordatorio\s+(de|del|sobre)\s+/i,
-    intent: 'cancel_reminder',
-    tier: 'deterministic',
-    confidence: 0.90,
-    extractParams: (input) => {
-      const match = input.match(/recordatorio\s+(?:de|del|sobre)\s+(.+)/i);
-      if (match && match[1]) {
-        return { query: match[1].trim() };
-      }
-      return undefined;
-    },
-  },
-  // Set reminder (must have both time and message indicators)
-  {
-    pattern: /\b(record[aá]me|remind me|avis[aá]me|alert[aá]me)\b.*\b(en|in|a las?|at|mañana|tomorrow|dentro de)\b/i,
-    intent: 'reminder',
-    tier: 'deterministic',
-    confidence: 0.85, // Lower confidence, let LLM extract params
-  },
-  // Grammar check - multiple patterns for flexibility
-  {
-    pattern: /\b(correg[ií]r?|corrig[eéia]|fix|check|revisar?)\s*(la\s+)?(ortograf[ií]a|gram[aá]tica|grammar|spelling)\b/i,
-    intent: 'grammar_check',
-    tier: 'local',
-    confidence: 0.92,
-  },
-  {
-    pattern: /\b(ortograf[ií]a|gram[aá]tica|spelling|grammar)\s+(de|del|check|fix)\b/i,
-    intent: 'grammar_check',
-    tier: 'local',
-    confidence: 0.88,
-  },
-  // Summarize
-  {
-    pattern: /\b(resum[eéi]|summarize|haz(me)?\s+un\s+resumen|make\s+a\s+summary)\b/i,
-    intent: 'summarize',
-    tier: 'local',
-    confidence: 0.90,
-  },
-  // Simple greetings (very high confidence, very common)
-  {
-    pattern: /^(hola|hi|hello|hey|buenos?\s*(d[ií]as?|tardes?|noches?)|good\s*(morning|afternoon|evening))[\s!.,]*$/i,
-    intent: 'simple_chat',
-    tier: 'local',
-    confidence: 0.99,
-  },
-  // Thanks
-  {
-    pattern: /^(gracias|thanks?|thank\s+you|thx|ty)[\s!.,]*$/i,
-    intent: 'simple_chat',
-    tier: 'local',
-    confidence: 0.99,
-  },
-];
-
-/**
- * Try fast-path matching before LLM classification.
- * Returns null if no fast-path match found.
+ * Wrapper for keyword-based fast-path that converts result to RouterV2Decision
  */
 function tryFastPath(input: string): RouterV2Decision | null {
-  const trimmed = input.trim();
+  const result = keywordFastPath(input);
+  if (!result) return null;
 
-  for (const rule of FAST_PATH_RULES) {
-    if (rule.pattern.test(trimmed)) {
-      const params = rule.extractParams?.(trimmed);
-
-      logger.debug('Fast-path match', {
-        intent: rule.intent,
-        tier: rule.tier,
-        confidence: rule.confidence,
-        hasParams: !!params,
-      });
-
-      return {
-        tier: rule.tier,
-        intent: rule.intent,
-        confidence: rule.confidence,
-        params,
-        reason: 'Fast-path pattern match',
-      };
-    }
-  }
-
-  return null;
+  return {
+    tier: result.tier,
+    intent: result.intent,
+    confidence: result.confidence,
+    params: result.params,
+    reason: result.reason,
+  };
 }
 
 /**
