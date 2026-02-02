@@ -32,8 +32,8 @@ function validateStartupRequirements(): string[] {
       warnings.push('user.md not found - using defaults');
     } else {
       const content = readFileSync(userMdPath, 'utf-8');
-      // Case-insensitive check for timezone (may be **Timezone**: in markdown)
-      if (!/timezone:/i.test(content)) {
+      // Check for timezone (handles markdown formatting like **Timezone**:)
+      if (!/timezone/i.test(content)) {
         warnings.push('user.md missing timezone - proactive timing may be off');
       }
     }
