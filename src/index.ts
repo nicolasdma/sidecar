@@ -181,6 +181,29 @@ async function main(): Promise<void> {
     logger.warn('Decay check failed at startup', { error });
   }
 
+  // Fase 3.6a: Initialize device module FIRST
+  // This detects hardware, assigns tier, and determines which models to use.
+  // Must happen before LocalRouter so classifier knows which model to use.
+  let deviceProfile: import('./device/types.js').DeviceProfile | null = null;
+  try {
+    const deviceResult = await initializeDevice();
+    deviceProfile = deviceResult.profile;
+
+    // Initialize Router v2 with device profile
+    initializeRouterV2(deviceProfile);
+
+    logger.info('Device module initialized', {
+      tier: deviceProfile.tier,
+      ollamaAvailable: deviceResult.ollamaHealth.available,
+      modelsAvailable: deviceResult.ollamaHealth.modelsAvailable.length,
+    });
+  } catch (error) {
+    logger.warn('Device module initialization failed', {
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+    // Non-fatal: continue without device features (productivity tools will fallback to API)
+  }
+
   // Fase 2: Start background extraction worker
   await startExtractionWorker();
 
@@ -200,11 +223,12 @@ async function main(): Promise<void> {
   }
 
   // Fase 3.5: Initialize and warm up LocalRouter
-  // This loads Qwen2.5-3B into memory for faster first request
+  // Uses classifier model from device profile (or default if device init failed)
   let localRouterReady = false;
   if (config.localRouter.enabled) {
     try {
-      await initializeLocalRouter(config.localRouter, true);
+      const classifierModel = deviceProfile?.classifierModel;
+      await initializeLocalRouter(config.localRouter, true, classifierModel);
       localRouterReady = true;
       logger.info('LocalRouter initialized');
     } catch (error) {
@@ -214,27 +238,6 @@ async function main(): Promise<void> {
     }
   } else {
     logger.debug('LocalRouter disabled');
-  }
-
-  // Fase 3.6a: Initialize device module and Router v2
-  // This enables local LLM productivity tools (translate, summarize, etc.)
-  try {
-    const deviceResult = await initializeDevice();
-    const profile = deviceResult.profile;
-
-    // Initialize Router v2 with device profile
-    initializeRouterV2(profile);
-
-    logger.info('Device module initialized', {
-      tier: profile.tier,
-      ollamaAvailable: deviceResult.ollamaHealth.available,
-      modelsAvailable: deviceResult.ollamaHealth.modelsAvailable.length,
-    });
-  } catch (error) {
-    logger.warn('Device module initialization failed', {
-      error: error instanceof Error ? error.message : 'Unknown error',
-    });
-    // Non-fatal: continue without device features (productivity tools will fallback to API)
   }
 
   // Fase 3.6c: Initialize MCP servers (parallel, non-blocking)

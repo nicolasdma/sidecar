@@ -3,6 +3,7 @@ import type { Tool, ToolResult, ToolExecutionContext } from './types.js';
 import { createToolDefinition } from './types.js';
 import { createLogger } from '../utils/logger.js';
 import { withTimeout, TIMEOUTS } from '../utils/timeout.js';
+import { getMCPClientManager, createMCPToolAdapter, type MCPToolAdapter } from '../mcp/index.js';
 
 const logger = createLogger('tools');
 
@@ -15,6 +16,10 @@ export { createExecutionContext, getToolCallCount, incrementToolCallCount } from
 
 class ToolRegistry {
   private tools: Map<string, Tool> = new Map();
+  private mcpAdapter: MCPToolAdapter | null = null;
+  private mcpToolsCache: Map<string, Tool> = new Map();
+  private mcpCacheTime: number = 0;
+  private readonly MCP_CACHE_TTL_MS = 5000; // Cache MCP tools for 5 seconds
 
   register(tool: Tool): void {
     if (this.tools.has(tool.name)) {
@@ -36,8 +41,63 @@ class ToolRegistry {
     return Array.from(this.tools.values());
   }
 
+  /**
+   * Get local tool definitions only.
+   */
   getDefinitions(): ToolDefinition[] {
     return this.getAll().map(createToolDefinition);
+  }
+
+  /**
+   * Get combined tool definitions (local + MCP).
+   * MCP tools are fetched from connected servers.
+   */
+  async getDefinitionsWithMCP(): Promise<ToolDefinition[]> {
+    const adapter = this.getMCPAdapter();
+    const allTools = await adapter.getAllToolsUnified(this.getAll());
+    return allTools.map(createToolDefinition);
+  }
+
+  /**
+   * Get the MCP tool adapter, lazily initialized.
+   */
+  private getMCPAdapter(): MCPToolAdapter {
+    if (!this.mcpAdapter) {
+      this.mcpAdapter = createMCPToolAdapter(getMCPClientManager());
+    }
+    return this.mcpAdapter;
+  }
+
+  /**
+   * Refresh MCP tools cache if expired.
+   */
+  private async refreshMCPToolsCache(): Promise<void> {
+    const now = Date.now();
+    if (now - this.mcpCacheTime < this.MCP_CACHE_TTL_MS) {
+      return; // Cache still valid
+    }
+
+    const adapter = this.getMCPAdapter();
+    const mcpTools = await adapter.getMCPTools();
+
+    this.mcpToolsCache.clear();
+    for (const tool of mcpTools) {
+      this.mcpToolsCache.set(tool.name, tool);
+    }
+    this.mcpCacheTime = now;
+  }
+
+  /**
+   * Find a tool by name, checking local tools first, then MCP.
+   */
+  async findTool(name: string): Promise<Tool | undefined> {
+    // Check local tools first
+    const localTool = this.tools.get(name);
+    if (localTool) return localTool;
+
+    // Check MCP tools
+    await this.refreshMCPToolsCache();
+    return this.mcpToolsCache.get(name);
   }
 
   async execute(
@@ -45,7 +105,8 @@ class ToolRegistry {
     args: Record<string, unknown>,
     context?: ToolExecutionContext
   ): Promise<ToolResult> {
-    const tool = this.tools.get(name);
+    // Check local tools first, then MCP
+    const tool = await this.findTool(name);
 
     if (!tool) {
       logger.error(`Tool not found: ${name}`);
@@ -61,6 +122,7 @@ class ToolRegistry {
     try {
       // Issue #2: Add timeout protection to prevent indefinite hangs
       // Issue #1: Pass context to tool for per-turn state management
+      // Note: MCP tools have their own internal timeout, but we wrap for safety
       const result = await withTimeout(
         tool.execute(args, context),
         TOOL_TIMEOUT_MS,
@@ -111,6 +173,14 @@ export function executeTool(
 
 export function getToolDefinitions(): ToolDefinition[] {
   return toolRegistry.getDefinitions();
+}
+
+/**
+ * Get combined tool definitions (local + MCP).
+ * Use this to provide all available tools to the LLM.
+ */
+export async function getToolDefinitionsWithMCP(): Promise<ToolDefinition[]> {
+  return toolRegistry.getDefinitionsWithMCP();
 }
 
 /**

@@ -1,6 +1,7 @@
 import {
   registerTool,
   getToolDefinitions,
+  getToolDefinitionsWithMCP,
   executeTool,
   notifyToolsTurnStart,
   createExecutionContext,
@@ -27,6 +28,7 @@ export function initializeTools(): void {
 
 export {
   getToolDefinitions,
+  getToolDefinitionsWithMCP,
   executeTool,
   notifyToolsTurnStart,
   createExecutionContext,
