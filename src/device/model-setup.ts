@@ -18,20 +18,26 @@ const SETUP_STATE_KEY = 'model_setup_state';
 /**
  * Essential models by tier.
  * These will be auto-pulled on first run if not present.
+ *
+ * Simplified model strategy:
+ * - basic: Single 3b model for everything
+ * - standard: Single 7b model for everything
+ * - power: 7b for classification, 9b for productivity
+ * - server: Same as power + mistral for variety
  */
 const ESSENTIAL_MODELS: Record<DeviceTier, string[]> = {
   minimal: [], // No local models needed
-  basic: ['qwen2.5:3b-instruct'], // Classifier only
-  standard: ['qwen2.5:3b-instruct', 'qwen2.5:7b-instruct'], // Classifier + productivity
-  power: ['qwen2.5:3b-instruct', 'qwen2.5:7b-instruct', 'gemma2:9b'], // Full set
-  server: ['qwen2.5:3b-instruct', 'qwen2.5:7b-instruct', 'gemma2:9b', 'mistral:7b-instruct'],
+  basic: ['qwen2.5:3b-instruct'], // Single model for classification + productivity
+  standard: ['qwen2.5:7b-instruct'], // Single model for classification + productivity
+  power: ['qwen2.5:7b-instruct', 'gemma2:9b'], // 7b classifier, 9b productivity
+  server: ['qwen2.5:7b-instruct', 'gemma2:9b', 'mistral:7b-instruct'],
 };
 
 /**
  * Model sizes for progress estimation (in GB)
  */
 const MODEL_SIZES: Record<string, number> = {
-  'qwen2.5:3b-instruct': 2.0,
+  'qwen2.5:3b-instruct': 2.0, // Only for basic tier
   'qwen2.5:7b-instruct': 4.7,
   'gemma2:9b': 5.4,
   'mistral:7b-instruct': 4.1,

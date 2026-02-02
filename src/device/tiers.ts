@@ -21,6 +21,15 @@ const logger = createLogger('device:tiers');
 /**
  * Profile definitions for each tier
  */
+/**
+ * Simplified model strategy (Fase 3.6b):
+ * - basic: Single 3b model for everything
+ * - standard: Single 7b model for everything
+ * - power: 7b for classification, 9b for productivity (2 models total)
+ * - server: Same as power + mistral for variety
+ *
+ * This reduces disk usage and cold start times.
+ */
 const TIER_PROFILES: Record<DeviceTier, DeviceProfile> = {
   minimal: {
     tier: 'minimal',
@@ -36,31 +45,31 @@ const TIER_PROFILES: Record<DeviceTier, DeviceProfile> = {
     concurrentModels: 1,
     recommendedModels: ['qwen2.5:3b-instruct'],
     embeddingsLocal: true,
-    classifierModel: 'qwen2.5:3b-instruct',
+    classifierModel: 'qwen2.5:3b-instruct', // Same model for classification + productivity
   },
   standard: {
     tier: 'standard',
     maxModelSize: '7b',
     concurrentModels: 1,
-    recommendedModels: ['qwen2.5:7b-instruct', 'mistral:7b-instruct', 'gemma2:9b'],
+    recommendedModels: ['qwen2.5:7b-instruct'],
     embeddingsLocal: true,
-    classifierModel: 'qwen2.5:3b-instruct',
+    classifierModel: 'qwen2.5:7b-instruct', // Same model for classification + productivity
   },
   power: {
     tier: 'power',
     maxModelSize: '13b',
     concurrentModels: 2,
-    recommendedModels: ['qwen2.5:14b-instruct', 'llama3:13b', 'mixtral:8x7b'],
+    recommendedModels: ['gemma2:9b', 'qwen2.5:7b-instruct'],
     embeddingsLocal: true,
-    classifierModel: 'qwen2.5:3b-instruct',
+    classifierModel: 'qwen2.5:7b-instruct', // 7b for classification, 9b for productivity
   },
   server: {
     tier: 'server',
     maxModelSize: '70b',
     concurrentModels: 3,
-    recommendedModels: ['qwen2.5:72b-instruct', 'llama3:70b'],
+    recommendedModels: ['gemma2:9b', 'mistral:7b-instruct', 'qwen2.5:7b-instruct'],
     embeddingsLocal: true,
-    classifierModel: 'qwen2.5:7b-instruct', // Can use a better one
+    classifierModel: 'qwen2.5:7b-instruct',
   },
 };
 

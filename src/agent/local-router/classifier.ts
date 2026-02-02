@@ -5,7 +5,7 @@
  * Ported from spike implementation with production-ready error handling.
  */
 
-import { generateWithOllama, checkOllamaAvailability } from '../../llm/ollama.js';
+import { generateWithOllama, resolveClassifierModel } from '../../llm/ollama.js';
 import { createLogger } from '../../utils/logger.js';
 import type { Intent, Route, ClassificationResult } from './types.js';
 import { DIRECT_TOOL_INTENTS, CONFIDENCE_THRESHOLDS } from './types.js';
@@ -15,9 +15,21 @@ const logger = createLogger('local-router:classifier');
 
 /**
  * Expected Ollama model name.
- * We validate the exact model, not just prefix.
+ * Configured at runtime by initializeLocalRouter() from device profile.
+ * Falls back to env var or default if not set.
  */
-const EXPECTED_MODEL = process.env.OLLAMA_MODEL || 'qwen2.5:3b-instruct';
+let configuredModel: string | null = null;
+
+function getExpectedModel(): string {
+  return configuredModel || process.env.OLLAMA_MODEL || 'qwen2.5:7b-instruct';
+}
+
+/**
+ * Set the classifier model. Called by initializeLocalRouter with device profile.
+ */
+export function setClassifierModel(model: string): void {
+  configuredModel = model;
+}
 
 /**
  * Classification prompt optimized for Qwen2.5-3B.
@@ -156,24 +168,40 @@ function determineRoute(intent: Intent, confidence: number): Route {
 }
 
 /**
- * Validates that the expected model is available.
- * Checks exact model name, not just prefix.
+ * The model to use for classification (resolved at runtime).
+ * May differ from configured model if fallback was needed.
+ */
+let resolvedModel: string | null = null;
+
+/**
+ * Get the model to use for classification.
+ * Uses resolved model if available, otherwise configured model.
+ */
+function getClassifierModel(): string {
+  return resolvedModel || getExpectedModel();
+}
+
+/**
+ * Validates that a model is available for classification.
+ * Uses intelligent fallback: tries configured model first, then alternatives.
  */
 export async function validateModel(): Promise<{ valid: boolean; error?: string }> {
-  const availability = await checkOllamaAvailability();
+  // First try to resolve the best available model
+  const available = await resolveClassifierModel();
 
-  if (!availability.available) {
-    return { valid: false, error: availability.error };
-  }
-
-  // The model field from checkOllamaAvailability is set if model was found
-  if (availability.model) {
+  if (available) {
+    // Found an available model (may be fallback)
+    if (available !== getExpectedModel()) {
+      logger.info(`Using fallback model: ${available} (configured: ${getExpectedModel()})`);
+    }
+    resolvedModel = available;
     return { valid: true };
   }
 
+  // No model available at all
   return {
     valid: false,
-    error: `Model ${EXPECTED_MODEL} not available`,
+    error: `No models available. Install with: ollama pull ${getExpectedModel()}`
   };
 }
 
@@ -205,10 +233,11 @@ export async function classifyIntent(
 
   try {
     const prompt = CLASSIFICATION_PROMPT + message;
+    const model = getClassifierModel();
     const response = await generateWithOllama(prompt, {
       temperature: 0.1, // Low temp for consistent classification
       num_predict: 256, // Short response expected
-    });
+    }, model);
 
     const parsed = parseClassificationResponse(response);
     let intent = parsed.intent || 'unknown';

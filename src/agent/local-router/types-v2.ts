@@ -53,13 +53,14 @@ export const DETERMINISTIC_INTENTS: Intent[] = [
 /**
  * Model preferences per intent.
  * First available model in the list will be used.
+ * Include smaller models (3b) as fallbacks to avoid unnecessary API calls.
  */
 export const INTENT_MODEL_PREFERENCES: Record<LocalLLMIntent, string[]> = {
-  translate: ['gemma2:9b', 'qwen2.5:7b-instruct', 'mistral:7b-instruct'],
-  grammar_check: ['qwen2.5:7b-instruct', 'mistral:7b-instruct'],
-  summarize: ['qwen2.5:7b-instruct', 'mistral:7b-instruct'],
-  explain: ['gemma2:9b', 'qwen2.5:7b-instruct'],
-  simple_chat: ['mistral:7b-instruct', 'qwen2.5:7b-instruct'],
+  translate: ['gemma2:9b', 'qwen2.5:7b-instruct', 'mistral:7b-instruct', 'qwen2.5:3b-instruct'],
+  grammar_check: ['qwen2.5:7b-instruct', 'mistral:7b-instruct', 'qwen2.5:3b-instruct'],
+  summarize: ['qwen2.5:7b-instruct', 'mistral:7b-instruct', 'qwen2.5:3b-instruct'],
+  explain: ['gemma2:9b', 'qwen2.5:7b-instruct', 'qwen2.5:3b-instruct'],
+  simple_chat: ['mistral:7b-instruct', 'qwen2.5:7b-instruct', 'gemma2:9b', 'qwen2.5:3b-instruct'],
 };
 
 /**

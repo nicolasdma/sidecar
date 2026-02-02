@@ -80,22 +80,27 @@ export function detectFormality(input: string): 'formal' | 'informal' | undefine
  * - "Traduce al inglés: Hello world"
  * - "Translate to Spanish: Hola mundo"
  * - "Cómo se dice 'hello' en español?"
+ * - "traducí 'hello world' al español"
  */
 export function extractTextToTranslate(input: string): string {
-  // Pattern: "traduce/translate X: [text]"
-  const colonMatch = input.match(/(?:traduc[eai]|translate)[^:]*:\s*(.+)/is);
+  // Pattern 1: "traduce/translate X: [text]"
+  const colonMatch = input.match(/(?:traduc[eaií]|translate)[^:]*:\s*(.+)/is);
   if (colonMatch && colonMatch[1]) return colonMatch[1].trim();
 
-  // Pattern: "cómo se dice '[text]' en X"
-  const quoteMatch = input.match(/(?:cómo se dice|how do you say)\s*['""]?([^'""]+)['""]?\s*(?:en|in)/i);
-  if (quoteMatch && quoteMatch[1]) return quoteMatch[1].trim();
+  // Pattern 2: Text in quotes - "traducí 'text' al español" or "translate "text" to english"
+  const quotedMatch = input.match(/["'""']([^"'""']+)["'""']/);
+  if (quotedMatch && quotedMatch[1]) return quotedMatch[1].trim();
 
-  // Pattern: "traduce esto: [text]" or just "[instruction] [text]"
-  // Fall back to removing the instruction part
+  // Pattern 3: "cómo se dice [text] en X"
+  const comoMatch = input.match(/(?:cómo se dice|how do you say)\s+(.+?)\s+(?:en|in|al|to)\s+\w+/i);
+  if (comoMatch && comoMatch[1]) return comoMatch[1].trim();
+
+  // Pattern 4: Remove instruction words and language specification
   const cleaned = input
-    .replace(/^(?:traduc[eai]|translate)\s+(?:esto|this|al|to|a|into)\s+\w+\s*/i, '')
-    .replace(/^(?:cómo se dice|how do you say)\s*/i, '')
-    .replace(/\s*(?:en|in|al|to)\s+\w+\s*$/i, '')
+    // Remove leading "traduce/translate/traducí"
+    .replace(/^(?:traduc[eaií]|translate|por favor traduc[eaií])\s*/i, '')
+    // Remove "al/to/a [language]" at the end
+    .replace(/\s+(?:al|to|a|en|in)\s+(?:español|spanish|inglés|english|francés|french|portugués|portuguese|alemán|german|italiano|italian|chino|chinese|japonés|japanese|coreano|korean|ruso|russian|árabe|arabic)\s*$/i, '')
     .trim();
 
   return cleaned || input;

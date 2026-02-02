@@ -9,7 +9,7 @@
  */
 
 import { createLogger } from '../../utils/logger.js';
-import { classifyIntent, warmupClassifier, validateModel } from './classifier.js';
+import { classifyIntent, warmupClassifier, validateModel, setClassifierModel } from './classifier.js';
 import { getSystemStateJson, setSystemStateJson } from '../../memory/store.js';
 import { executeIntent } from './direct-executor.js';
 import type {
@@ -469,11 +469,20 @@ export function getLocalRouter(config?: Partial<LocalRouterConfig>): LocalRouter
 
 /**
  * Initialize LocalRouter with optional warmup.
+ * @param config - Router configuration
+ * @param warmup - Whether to warm up the classifier
+ * @param classifierModel - Model name from device profile (e.g., 'qwen2.5:7b-instruct')
  */
 export async function initializeLocalRouter(
   config?: Partial<LocalRouterConfig>,
-  warmup: boolean = true
+  warmup: boolean = true,
+  classifierModel?: string
 ): Promise<LocalRouter> {
+  // Configure classifier model from device profile
+  if (classifierModel && classifierModel !== 'none') {
+    setClassifierModel(classifierModel);
+  }
+
   const router = getLocalRouter(config);
 
   if (warmup) {
