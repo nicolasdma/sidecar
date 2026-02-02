@@ -119,12 +119,18 @@ const FAST_PATH_RULES: FastPathRule[] = [
     tier: 'deterministic',
     confidence: 0.85, // Lower confidence, let LLM extract params
   },
-  // Grammar check
+  // Grammar check - multiple patterns for flexibility
   {
-    pattern: /\b(corrig[eéi]|fix|check)\s*(mi|my|el|the|this|este)?\s*(gram[aá]tica|grammar|ortograf[ií]a|spelling|texto|text)\b/i,
+    pattern: /\b(correg[ií]r?|corrig[eéia]|fix|check|revisar?)\s*(la\s+)?(ortograf[ií]a|gram[aá]tica|grammar|spelling)\b/i,
     intent: 'grammar_check',
     tier: 'local',
-    confidence: 0.90,
+    confidence: 0.92,
+  },
+  {
+    pattern: /\b(ortograf[ií]a|gram[aá]tica|spelling|grammar)\s+(de|del|check|fix)\b/i,
+    intent: 'grammar_check',
+    tier: 'local',
+    confidence: 0.88,
   },
   // Summarize
   {
