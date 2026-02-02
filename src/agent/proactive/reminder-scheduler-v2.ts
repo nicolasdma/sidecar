@@ -28,6 +28,7 @@ import { recordReminderSent } from './state.js';
 import { getMessageRouter } from '../../interfaces/message-router.js';
 import type { NotificationMetadata } from '../../interfaces/types.js';
 import { createLogger } from '../../utils/logger.js';
+import { fromDbString, toJSDate } from '../../utils/datetime.js';
 
 const logger = createLogger('reminder-scheduler-v2');
 
@@ -39,12 +40,13 @@ const CATCHUP_DELAY_MS = 500; // Delay between catch-up dispatches
 
 /**
  * Convert ReminderRow to QueuedReminder.
+ * Uses fromDbString to correctly parse UTC timestamps from SQLite.
  */
 function toQueuedReminder(row: ReminderRow): QueuedReminder {
   return {
     id: row.id,
     message: row.message,
-    triggerAt: new Date(row.trigger_at),
+    triggerAt: toJSDate(fromDbString(row.trigger_at)),
   };
 }
 

@@ -1,129 +1,81 @@
 /**
  * Deterministic date parser for Spanish natural language.
  *
+ * Refactorizado con Luxon para manejo correcto de timezones.
+ *
  * Supported formats:
- * - ISO 8601: "2026-02-01T15:00" or "2026-02-01T15:00:00"
  * - Relative: "en N minutos", "en N horas", "en N horas y M minutos"
  * - Tomorrow: "mañana a las H" or "mañana a las H:MM"
- * - Today: "hoy a las H" or "hoy a las H:MM" (error if past)
+ * - Today: "hoy a las H" or "hoy a las H:MM"
  * - Weekday: "el lunes/martes/.../domingo a las H[:MM]"
  *
- * Design: All parsing is regex-based and deterministic. No LLM involved.
+ * Design:
+ * - All parsing is regex-based and deterministic (no LLM)
+ * - Timezone del usuario se respeta en todos los cálculos
+ * - Internamente todo es UTC
  */
 
 import { createLogger } from '../../utils/logger.js';
+import {
+  createDateTimeInUserTz,
+  createDateTimeForWeekday,
+  createRelativeDateTime,
+  isInFuture,
+  isValidTimezone,
+  formatForUser,
+  toJSDate,
+  setMockNow,
+  clearMockNow,
+  type ParseResult,
+  type ParsedDateTime,
+} from '../../utils/datetime.js';
 
 const logger = createLogger('date-parser');
 
 /**
- * Result of date parsing attempt.
+ * Re-export types for consumers
+ */
+export type { ParseResult, ParsedDateTime };
+
+/**
+ * Legacy interface for backward compatibility.
+ * @deprecated Use ParseResult instead
  */
 export interface DateParseResult {
   success: boolean;
   datetime?: Date;
   error?: string;
   suggestion?: string;
-  /** Human-readable formatted time for confirmation */
   formatted?: string;
 }
 
 /**
- * Weekday name to JS Date day number mapping (0=Sunday, 1=Monday, etc.)
+ * Weekday name to ISO weekday number (1=Monday, 7=Sunday)
  */
 const WEEKDAYS: Record<string, number> = {
-  domingo: 0,
   lunes: 1,
   martes: 2,
+  miercoles: 3,
   miércoles: 3,
-  miercoles: 3, // Without accent
   jueves: 4,
   viernes: 5,
+  sabado: 6,
   sábado: 6,
-  sabado: 6, // Without accent
+  domingo: 7,
 };
 
 /**
- * Validate that a timezone string is a valid IANA timezone.
+ * Parse relative time: "en N minutos", "en N horas", "N minutes", etc.
  */
-function isValidTimezone(tz: string): boolean {
-  try {
-    Intl.DateTimeFormat(undefined, { timeZone: tz });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Format a date for human display in Spanish.
- */
-function formatDateTime(date: Date, timezone: string): string {
-  const options: Intl.DateTimeFormatOptions = {
-    weekday: 'long',
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-    timeZone: timezone,
-  };
-
-  return date.toLocaleString('es-AR', options);
-}
-
-/**
- * Parse ISO 8601 datetime string.
- */
-function parseISO(input: string, timezone: string): DateParseResult | null {
-  // Match ISO 8601: YYYY-MM-DDTHH:MM or YYYY-MM-DDTHH:MM:SS
-  const isoRegex = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/;
-  const match = input.match(isoRegex);
-
-  if (!match) return null;
-
-  const year = match[1]!;
-  const month = match[2]!;
-  const day = match[3]!;
-  const hour = match[4]!;
-  const minute = match[5]!;
-  const date = new Date(
-    parseInt(year, 10),
-    parseInt(month, 10) - 1,
-    parseInt(day, 10),
-    parseInt(hour, 10),
-    parseInt(minute, 10),
-    0,
-    0
-  );
-
-  if (isNaN(date.getTime())) {
-    return {
-      success: false,
-      error: 'Fecha ISO inválida',
-    };
-  }
-
-  return {
-    success: true,
-    datetime: date,
-    formatted: formatDateTime(date, timezone),
-  };
-}
-
-/**
- * Parse relative time in Spanish and English:
- * Spanish: "en N minutos", "en N horas", "en N horas y M minutos"
- * English: "N minutes", "N hours", "in N minutes", "N hours and M minutes"
- */
-function parseRelative(input: string, now: Date): DateParseResult | null {
+function parseRelative(input: string, userTz: string): ParseResult | null {
   // Spanish: "en N minuto(s)"
   const minutesOnlyEs = input.match(/^en\s+(\d+)\s+minutos?$/i);
   if (minutesOnlyEs) {
     const minutes = parseInt(minutesOnlyEs[1]!, 10);
-    const result = new Date(now.getTime() + minutes * 60 * 1000);
+    const dt = createRelativeDateTime(0, minutes);
     return {
       success: true,
-      datetime: result,
+      result: { datetime: dt, formatted: formatForUser(dt, userTz) },
     };
   }
 
@@ -131,10 +83,10 @@ function parseRelative(input: string, now: Date): DateParseResult | null {
   const minutesOnlyEn = input.match(/^(?:in\s+)?(\d+)\s+minutes?$/i);
   if (minutesOnlyEn) {
     const minutes = parseInt(minutesOnlyEn[1]!, 10);
-    const result = new Date(now.getTime() + minutes * 60 * 1000);
+    const dt = createRelativeDateTime(0, minutes);
     return {
       success: true,
-      datetime: result,
+      result: { datetime: dt, formatted: formatForUser(dt, userTz) },
     };
   }
 
@@ -142,10 +94,10 @@ function parseRelative(input: string, now: Date): DateParseResult | null {
   const hoursOnlyEs = input.match(/^en\s+(\d+)\s+horas?$/i);
   if (hoursOnlyEs) {
     const hours = parseInt(hoursOnlyEs[1]!, 10);
-    const result = new Date(now.getTime() + hours * 60 * 60 * 1000);
+    const dt = createRelativeDateTime(hours, 0);
     return {
       success: true,
-      datetime: result,
+      result: { datetime: dt, formatted: formatForUser(dt, userTz) },
     };
   }
 
@@ -153,36 +105,38 @@ function parseRelative(input: string, now: Date): DateParseResult | null {
   const hoursOnlyEn = input.match(/^(?:in\s+)?(\d+)\s+hours?$/i);
   if (hoursOnlyEn) {
     const hours = parseInt(hoursOnlyEn[1]!, 10);
-    const result = new Date(now.getTime() + hours * 60 * 60 * 1000);
+    const dt = createRelativeDateTime(hours, 0);
     return {
       success: true,
-      datetime: result,
+      result: { datetime: dt, formatted: formatForUser(dt, userTz) },
     };
   }
 
   // Spanish: "en N hora(s) y M minuto(s)"
-  const compoundEs = input.match(/^en\s+(\d+)\s+horas?\s+y\s+(\d+)\s+minutos?$/i);
+  const compoundEs = input.match(
+    /^en\s+(\d+)\s+horas?\s+y\s+(\d+)\s+minutos?$/i
+  );
   if (compoundEs) {
     const hours = parseInt(compoundEs[1]!, 10);
     const minutes = parseInt(compoundEs[2]!, 10);
-    const totalMs = (hours * 60 + minutes) * 60 * 1000;
-    const result = new Date(now.getTime() + totalMs);
+    const dt = createRelativeDateTime(hours, minutes);
     return {
       success: true,
-      datetime: result,
+      result: { datetime: dt, formatted: formatForUser(dt, userTz) },
     };
   }
 
-  // English: "N hour(s) and M minute(s)" or "in N hour(s) and M minute(s)"
-  const compoundEn = input.match(/^(?:in\s+)?(\d+)\s+hours?\s+and\s+(\d+)\s+minutes?$/i);
+  // English: "N hour(s) and M minute(s)"
+  const compoundEn = input.match(
+    /^(?:in\s+)?(\d+)\s+hours?\s+and\s+(\d+)\s+minutes?$/i
+  );
   if (compoundEn) {
     const hours = parseInt(compoundEn[1]!, 10);
     const minutes = parseInt(compoundEn[2]!, 10);
-    const totalMs = (hours * 60 + minutes) * 60 * 1000;
-    const result = new Date(now.getTime() + totalMs);
+    const dt = createRelativeDateTime(hours, minutes);
     return {
       success: true,
-      datetime: result,
+      result: { datetime: dt, formatted: formatForUser(dt, userTz) },
     };
   }
 
@@ -190,49 +144,93 @@ function parseRelative(input: string, now: Date): DateParseResult | null {
 }
 
 /**
- * Parse time string like "9", "15", "9:30", "21:45"
- * Returns hour (0-23) and minute.
- * For ambiguous hours 1-11, caller decides interpretation.
+ * Parse "hoy a las H[:MM]"
+ *
+ * Regla de desambiguación para horas 1-11:
+ * - Si PM está en el futuro, usar PM (la gente dice "a las 3" = 15:00)
+ * - Si ambas pasaron, error
  */
-function parseTime(timeStr: string): { hour: number; minute: number } | null {
-  // Match HH:MM or H:MM
-  const withMinutes = timeStr.match(/^(\d{1,2}):(\d{2})$/);
-  if (withMinutes) {
-    const hour = parseInt(withMinutes[1]!, 10);
-    const minute = parseInt(withMinutes[2]!, 10);
-    if (hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59) {
-      return { hour, minute };
-    }
-    return null;
+function parseToday(input: string, userTz: string): ParseResult | null {
+  const match = input.match(/^hoy\s+a\s+las?\s+(\d{1,2})(?::(\d{2}))?$/i);
+  if (!match) return null;
+
+  const hour = parseInt(match[1]!, 10);
+  const minute = parseInt(match[2] || '0', 10);
+
+  if (hour > 23 || minute > 59) {
+    return { success: false, error: 'Hora inválida' };
   }
 
-  // Match just hour: H or HH
-  const hourOnly = timeStr.match(/^(\d{1,2})$/);
-  if (hourOnly) {
-    const hour = parseInt(hourOnly[1]!, 10);
-    if (hour >= 0 && hour <= 23) {
-      return { hour, minute: 0 };
-    }
-    return null;
-  }
+  try {
+    // Hora no ambigua (0, 12-23): usar directamente
+    if (hour === 0 || hour >= 12) {
+      const dt = createDateTimeInUserTz(userTz, {
+        hour,
+        minute,
+        daysFromNow: 0,
+      });
 
-  return null;
+      if (!isInFuture(dt)) {
+        const timeStr =
+          minute > 0 ? `${hour}:${minute.toString().padStart(2, '0')}` : `${hour}`;
+        return {
+          success: false,
+          error: `Las ${timeStr} ya pasó hoy`,
+          suggestion: `Probá con "mañana a las ${hour}"`,
+        };
+      }
+
+      return {
+        success: true,
+        result: { datetime: dt, formatted: formatForUser(dt, userTz) },
+      };
+    }
+
+    // Hora ambigua (1-11): preferir PM si está en el futuro
+    const pmHour = hour + 12;
+    const pmDt = createDateTimeInUserTz(userTz, {
+      hour: pmHour,
+      minute,
+      daysFromNow: 0,
+    });
+
+    if (isInFuture(pmDt)) {
+      // PM está en el futuro - usarlo (la gente dice "a las 3" = 15:00)
+      return {
+        success: true,
+        result: { datetime: pmDt, formatted: formatForUser(pmDt, userTz) },
+      };
+    }
+
+    // PM también pasó - error
+    const timeStr =
+      minute > 0 ? `${hour}:${minute.toString().padStart(2, '0')}` : `${hour}`;
+    return {
+      success: false,
+      error: `Las ${timeStr} (${pmHour}:00) ya pasó hoy`,
+      suggestion: `Probá con "mañana a las ${hour}"`,
+    };
+  } catch (error) {
+    // DST edge-case
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Error de fecha',
+      suggestion: 'Probá una hora diferente (posible cambio de horario)',
+    };
+  }
 }
 
 /**
  * Parse "mañana a las H[:MM]"
  */
-function parseTomorrow(
-  input: string,
-  timezone: string,
-  now: Date
-): DateParseResult | null {
-  const match = input.match(/^mañana\s+a\s+las?\s+(\d{1,2}(?::\d{2})?)$/i);
+function parseTomorrow(input: string, userTz: string): ParseResult | null {
+  const match = input.match(/^mañana\s+a\s+las?\s+(\d{1,2})(?::(\d{2}))?$/i);
   if (!match) return null;
 
-  const timeStr = match[1]!;
-  const parsed = parseTime(timeStr);
-  if (!parsed) {
+  const hour = parseInt(match[1]!, 10);
+  const minute = parseInt(match[2] || '0', 10);
+
+  if (hour > 23 || minute > 59) {
     return {
       success: false,
       error: 'Hora inválida',
@@ -240,173 +238,80 @@ function parseTomorrow(
     };
   }
 
-  const tomorrow = new Date(now);
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  tomorrow.setHours(parsed.hour, parsed.minute, 0, 0);
-
-  return {
-    success: true,
-    datetime: tomorrow,
-    formatted: formatDateTime(tomorrow, timezone),
-  };
-}
-
-/**
- * Parse "hoy a las H[:MM]"
- * Error if time is in the past.
- *
- * Hour disambiguation rule:
- * - If hour is 1-11 and current time is still AM (before noon):
- *   - If AM interpretation is past, convert to PM (user probably means "later today")
- * - If hour is 1-11 and current time is PM (after noon):
- *   - Interpret as AM literally. If past, error (user meant morning, missed it).
- */
-function parseToday(
-  input: string,
-  timezone: string,
-  now: Date
-): DateParseResult | null {
-  const match = input.match(/^hoy\s+a\s+las?\s+(\d{1,2}(?::\d{2})?)$/i);
-  if (!match) return null;
-
-  const timeStr = match[1]!;
-  const parsed = parseTime(timeStr);
-  if (!parsed) {
-    return {
-      success: false,
-      error: 'Hora inválida',
-      suggestion: 'Usá formato HH:MM, ej: "hoy a las 15:30"',
-    };
-  }
-
-  const { hour, minute } = parsed;
-  const currentHour = now.getHours();
-
-  // For 12-23 or 0 (midnight), no disambiguation needed
-  if (hour === 0 || hour >= 12) {
-    const today = new Date(now);
-    today.setHours(hour, minute, 0, 0);
-
-    // Check if time is in the past
-    if (today.getTime() < now.getTime()) {
-      const suggestedTime =
-        minute > 0 ? `${hour}:${minute.toString().padStart(2, '0')}` : `${hour}`;
-      return {
-        success: false,
-        error: `La hora ${suggestedTime} ya pasó hoy`,
-        suggestion: `Probá con "mañana a las ${suggestedTime}"`,
-      };
-    }
+  try {
+    const dt = createDateTimeInUserTz(userTz, {
+      hour,
+      minute,
+      daysFromNow: 1,
+    });
 
     return {
       success: true,
-      datetime: today,
-      formatted: formatDateTime(today, timezone),
+      result: { datetime: dt, formatted: formatForUser(dt, userTz) },
     };
-  }
-
-  // Hour is 1-11, needs disambiguation
-  const amTime = new Date(now);
-  amTime.setHours(hour, minute, 0, 0);
-
-  const pmTime = new Date(now);
-  pmTime.setHours(hour + 12, minute, 0, 0);
-
-  const isAmPast = amTime.getTime() < now.getTime();
-  const isPmPast = pmTime.getTime() < now.getTime();
-  const isCurrentlyAM = currentHour < 12;
-
-  // Rule: If we're still in AM hours and AM is past, convert to PM
-  // If we're in PM hours, interpret literally as AM (if past, error)
-  if (isCurrentlyAM && isAmPast && !isPmPast) {
-    // We're in the morning, AM time passed, use PM
-    return {
-      success: true,
-      datetime: pmTime,
-      formatted: formatDateTime(pmTime, timezone),
-    };
-  }
-
-  if (isAmPast) {
-    // AM is past and we can't convert to PM (either we're in PM or PM is also past)
-    const suggestedTime =
-      minute > 0 ? `${hour}:${minute.toString().padStart(2, '0')}` : `${hour}`;
+  } catch (error) {
     return {
       success: false,
-      error: `La hora ${suggestedTime} ya pasó hoy`,
-      suggestion: `Probá con "mañana a las ${suggestedTime}"`,
+      error: error instanceof Error ? error.message : 'Error de fecha',
+      suggestion: 'Probá una hora diferente (posible cambio de horario)',
     };
   }
-
-  // AM is still in the future - but should we interpret as AM or PM?
-  // If current time is AM, user probably means PM for hours like "3"
-  // If current time is PM, user probably means tomorrow's AM... but we say "hoy", so error might be confusing
-  // Conservative: if AM is in the future, use PM anyway (people say "a las 3" meaning 3 PM)
-  return {
-    success: true,
-    datetime: pmTime,
-    formatted: formatDateTime(pmTime, timezone),
-  };
 }
 
 /**
  * Parse "el [weekday] a las H[:MM]"
- * Always resolves to next occurrence (if today is that weekday, go to next week).
+ * Always resolves to next occurrence.
  */
-function parseWeekday(
-  input: string,
-  timezone: string,
-  now: Date
-): DateParseResult | null {
+function parseWeekday(input: string, userTz: string): ParseResult | null {
   const match = input.match(
-    /^el\s+(lunes|martes|mi[ée]rcoles|jueves|viernes|s[áa]bado|domingo)\s+a\s+las?\s+(\d{1,2}(?::\d{2})?)$/i
+    /^el\s+(lunes|martes|mi[ée]rcoles|jueves|viernes|s[áa]bado|domingo)\s+a\s+las?\s+(\d{1,2})(?::(\d{2}))?$/i
   );
   if (!match) return null;
 
-  const weekdayName = match[1]!.toLowerCase();
-  const timeStr = match[2]!;
+  // Normalize weekday name (remove accents for lookup)
+  const weekdayName = match[1]!
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+  const hour = parseInt(match[2]!, 10);
+  const minute = parseInt(match[3] || '0', 10);
 
-  const targetDay = WEEKDAYS[weekdayName];
-  if (targetDay === undefined) {
+  const weekday = WEEKDAYS[weekdayName];
+  if (weekday === undefined) {
     return {
       success: false,
-      error: `Día de la semana no reconocido: ${weekdayName}`,
+      error: `Día de la semana no reconocido: ${match[1]}`,
     };
   }
 
-  const parsed = parseTime(timeStr);
-  if (!parsed) {
+  if (hour > 23 || minute > 59) {
     return {
       success: false,
       error: 'Hora inválida',
-      suggestion: `Usá formato HH:MM, ej: "el ${weekdayName} a las 10:00"`,
+      suggestion: `Usá formato HH:MM, ej: "el ${match[1]} a las 10:00"`,
     };
   }
 
-  const currentDay = now.getDay();
+  try {
+    const dt = createDateTimeForWeekday(userTz, weekday, hour, minute);
 
-  // Calculate days until target weekday
-  // If today is the target weekday, we go to NEXT week (add 7)
-  let daysUntil = targetDay - currentDay;
-  if (daysUntil <= 0) {
-    daysUntil += 7;
+    return {
+      success: true,
+      result: { datetime: dt, formatted: formatForUser(dt, userTz) },
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Error de fecha',
+      suggestion: 'Probá una hora diferente (posible cambio de horario)',
+    };
   }
-
-  const targetDate = new Date(now);
-  targetDate.setDate(targetDate.getDate() + daysUntil);
-  targetDate.setHours(parsed.hour, parsed.minute, 0, 0);
-
-  return {
-    success: true,
-    datetime: targetDate,
-    formatted: formatDateTime(targetDate, timezone),
-  };
 }
 
 /**
- * Check for unsupported but common patterns and return helpful errors.
+ * Check for unsupported but common patterns with helpful errors.
  */
-function checkUnsupportedPatterns(input: string): DateParseResult | null {
+function checkUnsupportedPatterns(input: string): ParseResult | null {
   // "a las X" without day
   if (/^a\s+las?\s+\d+/i.test(input)) {
     return {
@@ -416,7 +321,7 @@ function checkUnsupportedPatterns(input: string): DateParseResult | null {
     };
   }
 
-  // "en un rato" or other vague expressions
+  // "en un rato"
   if (/en\s+un\s+rato/i.test(input)) {
     return {
       success: false,
@@ -443,7 +348,7 @@ function checkUnsupportedPatterns(input: string): DateParseResult | null {
     };
   }
 
-  // "pasado mañana" (could support in future, but currently ambiguous without time)
+  // "pasado mañana"
   if (/pasado\s+mañana/i.test(input)) {
     return {
       success: false,
@@ -456,85 +361,46 @@ function checkUnsupportedPatterns(input: string): DateParseResult | null {
 }
 
 /**
- * Main parsing function.
+ * Main parsing function (new API with discriminated union).
  *
- * @param input - The natural language date/time string
+ * @param input - Natural language date/time string
  * @param timezone - IANA timezone (e.g., "America/Argentina/Buenos_Aires")
- * @param now - Optional override for current time (for testing)
- * @returns DateParseResult with success status, datetime, or error
+ * @returns ParseResult with success status and datetime or error
  */
-export function parseDateTime(
-  input: string,
-  timezone: string,
-  now?: Date
-): DateParseResult {
-  // Validate timezone first
+export function parseDateTimeNew(input: string, timezone: string): ParseResult {
   if (!isValidTimezone(timezone)) {
-    logger.error('Invalid timezone', { timezone });
     return {
       success: false,
-      error: `timezone inválido: "${timezone}". Usá formato IANA, ej: "America/Argentina/Buenos_Aires"`,
+      error: `Timezone inválida: "${timezone}". Usá formato IANA, ej: "America/Argentina/Buenos_Aires"`,
     };
   }
 
-  // Use current time if not provided
-  // NOTE: new Date() returns the correct UTC timestamp regardless of system timezone.
-  // Relative calculations ("in 5 minutes") work correctly because we add milliseconds
-  // to the current UTC timestamp. The timezone parameter is only used for formatting.
-  const currentTime = now ?? new Date();
-
-  // Normalize input: trim, collapse whitespace, lowercase for matching
   const normalized = input.trim().replace(/\s+/g, ' ').toLowerCase();
 
-  // Empty input
   if (!normalized) {
     return {
       success: false,
       error: 'Entrada vacía',
-      suggestion: 'Especificá cuándo: "en 30 minutos", "mañana a las 9", etc.',
+      suggestion:
+        'Especificá cuándo: "en 30 minutos", "mañana a las 9", etc.',
     };
   }
 
-  // Try ISO 8601 first (use original case for ISO)
-  const isoResult = parseISO(input.trim(), timezone);
-  if (isoResult) {
-    if (isoResult.success && isoResult.datetime) {
-      isoResult.formatted = formatDateTime(isoResult.datetime, timezone);
-    }
-    return isoResult;
+  // Try each parser in order
+  const result =
+    parseRelative(normalized, timezone) ||
+    parseToday(normalized, timezone) ||
+    parseTomorrow(normalized, timezone) ||
+    parseWeekday(normalized, timezone);
+
+  if (result) {
+    return result;
   }
 
-  // Try relative time
-  const relativeResult = parseRelative(normalized, currentTime);
-  if (relativeResult) {
-    if (relativeResult.success && relativeResult.datetime) {
-      relativeResult.formatted = formatDateTime(relativeResult.datetime, timezone);
-    }
-    return relativeResult;
-  }
-
-  // Try "mañana a las X"
-  const tomorrowResult = parseTomorrow(normalized, timezone, currentTime);
-  if (tomorrowResult) {
-    return tomorrowResult;
-  }
-
-  // Try "hoy a las X"
-  const todayResult = parseToday(normalized, timezone, currentTime);
-  if (todayResult) {
-    return todayResult;
-  }
-
-  // Try "el [weekday] a las X"
-  const weekdayResult = parseWeekday(normalized, timezone, currentTime);
-  if (weekdayResult) {
-    return weekdayResult;
-  }
-
-  // Check for common unsupported patterns with helpful errors
-  const unsupportedResult = checkUnsupportedPatterns(normalized);
-  if (unsupportedResult) {
-    return unsupportedResult;
+  // Check for common unsupported patterns
+  const unsupported = checkUnsupportedPatterns(normalized);
+  if (unsupported) {
+    return unsupported;
   }
 
   // Unknown format
@@ -545,6 +411,45 @@ export function parseDateTime(
     suggestion:
       'Formatos soportados: "en 30 minutos", "mañana a las 9", "hoy a las 15", "el lunes a las 10"',
   };
+}
+
+/**
+ * Main parsing function (legacy API for backward compatibility).
+ *
+ * @deprecated Use parseDateTimeNew() for new code
+ */
+export function parseDateTime(
+  input: string,
+  timezone: string,
+  now?: Date // Optional reference time for testing (as UTC instant)
+): DateParseResult {
+  // Set mock time if provided (for testing)
+  if (now) {
+    setMockNow(now);
+  }
+
+  try {
+    const result = parseDateTimeNew(input, timezone);
+
+    if (result.success) {
+      return {
+        success: true,
+        datetime: toJSDate(result.result.datetime),
+        formatted: result.result.formatted,
+      };
+    }
+
+    return {
+      success: false,
+      error: result.error,
+      suggestion: result.suggestion,
+    };
+  } finally {
+    // Always clear mock time after parsing
+    if (now) {
+      clearMockNow();
+    }
+  }
 }
 
 export default parseDateTime;
