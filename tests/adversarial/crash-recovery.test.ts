@@ -18,8 +18,6 @@ import {
   recoverStalledExtractions,
   recoverStalledEmbeddings,
   queueMessageForExtraction,
-  markExtractionProcessing,
-  getPendingExtractions,
   getPendingExtractionCount,
   queueFactForEmbedding,
   markEmbeddingProcessing,
@@ -171,11 +169,10 @@ test('crash-recovery: stalled extractions are recovered', () => {
   // Queue it for extraction
   queueMessageForExtraction(messageId, `Test content ${uniqueMsg}`, 'user');
 
-  // Mark as processing (simulating app was in the middle of processing)
-  const pending = getPendingExtractions(1);
-  if (pending.length > 0 && pending[0]!.message_id === messageId) {
-    markExtractionProcessing(pending[0]!.id);
-  }
+  // Force it to processing status directly (simulating app crashed mid-processing)
+  db.prepare(`
+    UPDATE pending_extraction SET status = 'processing' WHERE message_id = ?
+  `).run(messageId);
 
   // Verify it's stuck in processing
   const processingBefore = db.prepare(`
