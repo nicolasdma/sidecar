@@ -364,18 +364,13 @@ async function processExtractionQueue(): Promise<void> {
     for (const item of items) {
       // Check if we should wait based on backoff
       if (item.attempts > 0 && item.last_attempt_at) {
-        const lastAttempt = new Date(item.last_attempt_at).getTime();
+        // Parse as UTC (SQLite stores UTC timestamps)
+        const lastAttempt = new Date(item.last_attempt_at + 'Z').getTime();
         const backoffDelay = BACKOFF_DELAYS[Math.min(item.attempts, BACKOFF_DELAYS.length - 1)] || 0;
         const timeSinceAttempt = Date.now() - lastAttempt;
         const shouldWait = timeSinceAttempt < backoffDelay;
 
         if (shouldWait) {
-          const retryIn = Math.ceil((backoffDelay - timeSinceAttempt) / 1000);
-          logger.debug('Extraction item in backoff', {
-            id: item.id,
-            attempt: item.attempts,
-            retryInSeconds: retryIn,
-          });
           skippedBackoff++;
           continue;
         }
@@ -385,13 +380,9 @@ async function processExtractionQueue(): Promise<void> {
       processed++;
     }
 
-    // Log summary
-    if (processed > 0 || skippedBackoff > 0) {
-      logger.debug('Extraction queue tick', {
-        total: items.length,
-        processed,
-        skippedBackoff,
-      });
+    // Only log when something actually happens (not every tick)
+    if (processed > 0) {
+      logger.info('Extraction queue processed', { processed, skippedBackoff });
     }
   } catch (error) {
     logger.error('Queue processing error', { error });
