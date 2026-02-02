@@ -1,3 +1,4 @@
+import { existsSync, readFileSync } from 'fs';
 import { startCLI } from './interfaces/cli.js';
 import { validateConfig, config } from './utils/config.js';
 import { closeDatabase, getPendingExtractionCount, getPendingEmbeddingCount } from './memory/store.js';
@@ -16,6 +17,42 @@ import { checkOllamaAvailability } from './llm/ollama.js';
 import { getTotalFactsCount } from './memory/facts-store.js';
 
 const logger = createLogger('main');
+
+/**
+ * C1: Validates that critical files exist before starting.
+ * Returns warnings for missing or incomplete configuration files.
+ */
+function validateStartupRequirements(): string[] {
+  const warnings: string[] = [];
+
+  // Check user.md exists and has timezone
+  try {
+    const userMdPath = config.paths.userMd;
+    if (!existsSync(userMdPath)) {
+      warnings.push('user.md not found - using defaults');
+    } else {
+      const content = readFileSync(userMdPath, 'utf-8');
+      if (!content.includes('timezone:')) {
+        warnings.push('user.md missing timezone - proactive timing may be off');
+      }
+    }
+  } catch (error) {
+    warnings.push('user.md unreadable - using defaults');
+    logger.debug('Failed to read user.md', { error: error instanceof Error ? error.message : error });
+  }
+
+  // Check SOUL.md exists
+  try {
+    if (!existsSync(config.paths.soul)) {
+      warnings.push('SOUL.md not found - using default personality');
+    }
+  } catch (error) {
+    warnings.push('SOUL.md check failed');
+    logger.debug('Failed to check SOUL.md', { error: error instanceof Error ? error.message : error });
+  }
+
+  return warnings;
+}
 
 /**
  * Logs startup status in a formatted box.
@@ -105,6 +142,12 @@ async function main(): Promise<void> {
   logger.info('Starting Sidecar...');
 
   validateConfig();
+
+  // C1: Validate critical files before proceeding
+  const startupWarnings = validateStartupRequirements();
+  for (const warning of startupWarnings) {
+    console.log(`⚠️  ${warning}`);
+  }
 
   // Fase 2: Run decay check at startup (marks 120+ day old facts as stale)
   try {

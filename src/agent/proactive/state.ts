@@ -30,6 +30,10 @@ import { createLogger } from '../../utils/logger.js';
 
 const logger = createLogger('proactive-state');
 
+// C3: Track proactive loop errors for crash recovery
+let proactiveErrorCount = 0;
+let lastProactiveError: Date | null = null;
+
 /**
  * Convert database row to ProactiveState object.
  */
@@ -442,4 +446,38 @@ export function getProactiveStatus(
       timezone: config.timezone,
     },
   };
+}
+
+/**
+ * C3: Record a proactive loop error.
+ */
+export function recordProactiveError(): void {
+  proactiveErrorCount++;
+  lastProactiveError = new Date();
+  logger.warn('Proactive error recorded', { count: proactiveErrorCount });
+}
+
+/**
+ * C3: Get the current proactive error count.
+ */
+export function getProactiveErrorCount(): number {
+  return proactiveErrorCount;
+}
+
+/**
+ * C3: Get the last proactive error timestamp.
+ */
+export function getLastProactiveError(): Date | null {
+  return lastProactiveError;
+}
+
+/**
+ * C3: Reset proactive error counter (called on successful tick).
+ */
+export function resetProactiveErrors(): void {
+  if (proactiveErrorCount > 0) {
+    logger.info('Proactive errors cleared', { previousCount: proactiveErrorCount });
+  }
+  proactiveErrorCount = 0;
+  lastProactiveError = null;
 }

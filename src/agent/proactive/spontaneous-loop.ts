@@ -27,6 +27,9 @@ import {
   recordMutexSkip,
   resetMutexSkips,
   tripCircuitBreaker,
+  recordProactiveError,
+  getProactiveErrorCount,
+  resetProactiveErrors,
 } from './state.js';
 import { buildSpontaneousContext, buildDecisionPrompt } from './context-builder.js';
 import { getMessageRouter } from '../../interfaces/message-router.js';
@@ -317,10 +320,25 @@ export function startSpontaneousLoop(
   // For now, use fixed 15-minute intervals
   const cronExpression = '*/15 * * * *';
 
+  // C3: Wrap cron callback with error tracking for crash recovery
   cronJob = cron.schedule(cronExpression, () => {
-    tick().catch((error) => {
-      logger.error('Unhandled error in spontaneous tick', { error });
-    });
+    tick()
+      .then(() => {
+        // Reset error counter on successful tick
+        resetProactiveErrors();
+      })
+      .catch((error) => {
+        logger.error('Unhandled error in spontaneous tick', { error });
+
+        // C3: Record error for health monitoring
+        recordProactiveError();
+
+        // C3: Log loudly if too many consecutive errors
+        const errorCount = getProactiveErrorCount();
+        if (errorCount >= 5) {
+          console.log('\n⚠️  Proactive loop experiencing repeated errors. Check /health.\n');
+        }
+      });
   });
 
   logger.info('Spontaneous loop started', {

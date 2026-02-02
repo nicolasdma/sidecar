@@ -26,6 +26,8 @@ import {
 const logger = createLogger('brain');
 
 const MAX_TOOL_ITERATIONS = 10;
+// C4: Maximum time for a single think() call before timing out
+const BRAIN_TIMEOUT_MS = 120_000; // 2 minutes
 
 interface BrainConfig {
   maxToolIterations?: number;
@@ -75,6 +77,8 @@ export class Brain {
    * Issue #7: Accepts either a string (backward compatible) or ThinkOptions
    * to support proactive mode where no user input is needed.
    *
+   * C4: Protected with timeout to prevent indefinite blocking.
+   *
    * @param optionsOrInput - User input string or ThinkOptions object
    * @returns The assistant's response
    */
@@ -85,6 +89,33 @@ export class Brain {
     const options: ThinkOptions = typeof optionsOrInput === 'string'
       ? { userInput: optionsOrInput }
       : optionsOrInput;
+
+    // C4: Create timeout promise to prevent indefinite blocking
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => {
+        reject(new Error('Brain timeout: LLM took too long'));
+      }, BRAIN_TIMEOUT_MS);
+    });
+
+    try {
+      // Race between actual work and timeout
+      return await Promise.race([
+        this.doThink(options),
+        timeoutPromise,
+      ]);
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('Brain timeout')) {
+        logger.error('Brain timeout', { input: options.userInput?.slice(0, 50) });
+        return 'Lo siento, tardé demasiado en responder. ¿Podés repetir?';
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * C4: Internal think implementation, separated for timeout wrapping.
+   */
+  private async doThink(options: ThinkOptions): Promise<string> {
 
     // Issue #1: Create fresh execution context for this turn
     // Issue #4: Notify all tools of turn start via registry hook
