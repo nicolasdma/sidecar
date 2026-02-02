@@ -28,6 +28,8 @@ import {
   enforceQueueSizeLimit,
   retryFailedExtractions,
   purgeExtractionQueue,
+  getSystemStateJson,
+  setSystemStateJson,
   type PendingExtractionRow,
 } from './store.js';
 import { saveFact, type NewFact } from './facts-store.js';
@@ -58,6 +60,138 @@ let workerTimer: ReturnType<typeof setInterval> | null = null;
 let isProcessing = false;
 let ollamaAvailable = false;
 let lastOllamaCheck = 0;
+
+// ============================================================================
+// Circuit Breaker (Fase 3.6 - Track B hardening)
+// Prevents excessive retries when Ollama is consistently failing.
+// ============================================================================
+
+interface ExtractionCircuitState {
+  consecutiveFailures: number;
+  circuitOpenUntil: number | null;
+  lastError: string | null;
+}
+
+const CIRCUIT_CONFIG = {
+  failureThreshold: 5,    // Open circuit after 5 consecutive failures
+  resetTimeMs: 60_000,    // Keep circuit open for 1 minute
+};
+
+let circuitState: ExtractionCircuitState = {
+  consecutiveFailures: 0,
+  circuitOpenUntil: null,
+  lastError: null,
+};
+
+/**
+ * Checks if the circuit breaker is open (blocking requests).
+ * If the reset time has passed, closes the circuit and allows retry.
+ */
+function isCircuitOpen(): boolean {
+  if (!circuitState.circuitOpenUntil) return false;
+
+  if (Date.now() >= circuitState.circuitOpenUntil) {
+    // Reset circuit - allow retry
+    circuitState.circuitOpenUntil = null;
+    circuitState.consecutiveFailures = 0;
+    circuitState.lastError = null;
+    persistCircuitState();
+    logger.info('Extraction circuit breaker reset, allowing retries');
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Records a successful extraction, resetting the circuit breaker.
+ */
+function recordCircuitSuccess(): void {
+  if (circuitState.consecutiveFailures > 0) {
+    logger.debug('Extraction circuit success, resetting failure count');
+  }
+  circuitState.consecutiveFailures = 0;
+  circuitState.lastError = null;
+  // Only persist if circuit was previously open
+  if (circuitState.circuitOpenUntil !== null) {
+    circuitState.circuitOpenUntil = null;
+    persistCircuitState();
+  }
+}
+
+/**
+ * Records an extraction failure. Opens circuit if threshold exceeded.
+ */
+function recordCircuitFailure(error: string): void {
+  circuitState.consecutiveFailures++;
+  circuitState.lastError = error;
+
+  if (circuitState.consecutiveFailures >= CIRCUIT_CONFIG.failureThreshold) {
+    circuitState.circuitOpenUntil = Date.now() + CIRCUIT_CONFIG.resetTimeMs;
+    logger.warn('Extraction circuit breaker OPENED', {
+      failures: circuitState.consecutiveFailures,
+      resetAt: new Date(circuitState.circuitOpenUntil).toISOString(),
+      lastError: error,
+    });
+    persistCircuitState();
+  }
+}
+
+/**
+ * Persists circuit breaker state to SQLite (survives restarts).
+ */
+function persistCircuitState(): void {
+  try {
+    setSystemStateJson('extraction_circuit_breaker', {
+      consecutiveFailures: circuitState.consecutiveFailures,
+      circuitOpenUntil: circuitState.circuitOpenUntil,
+      lastError: circuitState.lastError,
+    });
+  } catch (error) {
+    logger.warn('Failed to persist extraction circuit state', {
+      error: error instanceof Error ? error.message : 'Unknown',
+    });
+  }
+}
+
+/**
+ * Restores circuit breaker state from SQLite on startup.
+ */
+function restoreCircuitState(): void {
+  try {
+    const persisted = getSystemStateJson<{
+      consecutiveFailures: number;
+      circuitOpenUntil: number | null;
+      lastError: string | null;
+    }>('extraction_circuit_breaker');
+
+    if (persisted) {
+      // Only restore if circuit is still open (not expired)
+      if (persisted.circuitOpenUntil && persisted.circuitOpenUntil > Date.now()) {
+        circuitState = {
+          consecutiveFailures: persisted.consecutiveFailures,
+          circuitOpenUntil: persisted.circuitOpenUntil,
+          lastError: persisted.lastError,
+        };
+        logger.info('Restored extraction circuit breaker state', {
+          failures: persisted.consecutiveFailures,
+          openUntil: new Date(persisted.circuitOpenUntil).toISOString(),
+        });
+      } else if (persisted.consecutiveFailures > 0) {
+        // Circuit expired but remember failure history
+        circuitState.consecutiveFailures = persisted.consecutiveFailures;
+        circuitState.lastError = persisted.lastError;
+        logger.debug('Restored extraction failure count (circuit expired)', {
+          failures: persisted.consecutiveFailures,
+        });
+      }
+    }
+  } catch (error) {
+    logger.warn('Failed to restore extraction circuit state', {
+      error: error instanceof Error ? error.message : 'Unknown',
+    });
+  }
+}
 
 // Extraction prompt (English for token efficiency)
 const EXTRACTION_PROMPT = `Extract facts about the user from this message.
@@ -149,12 +283,14 @@ async function processExtractionItem(item: PendingExtractionRow): Promise<boolea
     }
 
     markExtractionCompleted(item.id);
-    resetExtractionFailures(); // Reset failure counter on success
+    resetExtractionFailures(); // Reset metrics counter on success
+    recordCircuitSuccess();    // Reset circuit breaker on success
     return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     markExtractionFailed(item.id, message);
-    recordExtractionFailure(); // Track consecutive failures
+    recordExtractionFailure();      // Track metrics failures
+    recordCircuitFailure(message);  // Track circuit breaker failures
 
     logger.warn('Extraction failed', {
       id: item.id,
@@ -195,6 +331,12 @@ async function checkOllamaWithCache(): Promise<boolean> {
 async function processExtractionQueue(): Promise<void> {
   // Prevent concurrent processing
   if (isProcessing) {
+    return;
+  }
+
+  // Check circuit breaker first
+  if (isCircuitOpen()) {
+    logger.debug('Extraction circuit open, skipping tick');
     return;
   }
 
@@ -331,6 +473,9 @@ export async function startExtractionWorker(): Promise<void> {
     return;
   }
 
+  // Restore circuit breaker state from previous session
+  restoreCircuitState();
+
   // Recover stalled extractions from previous crash
   const recovered = recoverStalledExtractions();
   if (recovered > 0) {
@@ -339,6 +484,13 @@ export async function startExtractionWorker(): Promise<void> {
 
   // Cleanup old extractions on startup
   cleanupOldExtractions();
+
+  // Warn about large backlog (Track B.3 - error visibility)
+  const pendingCount = getPendingExtractionCount();
+  if (pendingCount > 100) {
+    console.log(`\u26a0\ufe0f  Large extraction backlog: ${pendingCount} items pending`);
+    logger.warn('Large extraction backlog detected at startup', { pending: pendingCount });
+  }
 
   // Initial Ollama availability check (non-blocking - worker will retry)
   const availability = await checkOllamaAvailability();
@@ -361,7 +513,6 @@ export async function startExtractionWorker(): Promise<void> {
   }, WORKER_INTERVAL_MS);
 
   // Also run immediately if there are pending items and Ollama is available
-  const pendingCount = getPendingExtractionCount();
   if (pendingCount > 0 && ollamaAvailable) {
     logger.info('Processing existing queue', { pending: pendingCount });
     processExtractionQueue().catch(error => {
@@ -383,17 +534,31 @@ export function stopExtractionWorker(): void {
 }
 
 /**
- * Gets extraction service status.
+ * Gets extraction service status including circuit breaker state.
  */
 export function getExtractionStatus(): {
   running: boolean;
   pending: number;
   ollamaAvailable: boolean;
+  circuitBreaker: {
+    isOpen: boolean;
+    consecutiveFailures: number;
+    openUntil: string | null;
+    lastError: string | null;
+  };
 } {
   return {
     running: workerTimer !== null,
     pending: getPendingExtractionCount(),
     ollamaAvailable,
+    circuitBreaker: {
+      isOpen: isCircuitOpen(),
+      consecutiveFailures: circuitState.consecutiveFailures,
+      openUntil: circuitState.circuitOpenUntil
+        ? new Date(circuitState.circuitOpenUntil).toISOString()
+        : null,
+      lastError: circuitState.lastError,
+    },
   };
 }
 

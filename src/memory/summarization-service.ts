@@ -13,6 +13,8 @@ import {
   saveSummary,
   getActiveSummaries,
   getSummaryCount,
+  getSystemStateJson,
+  setSystemStateJson,
   type SummaryRow,
   type SummaryData,
 } from './store.js';
@@ -35,6 +37,143 @@ Maximum 5 discussed points, 3 decisions, 3 open questions.
 
 Messages:
 `;
+
+// ============================================================================
+// Circuit Breaker (Fase 3.6 - Track B hardening)
+// Prevents excessive summarization attempts when Ollama is consistently failing.
+// ============================================================================
+
+interface SummarizationCircuitState {
+  consecutiveFailures: number;
+  circuitOpenUntil: number | null;
+  lastError: string | null;
+}
+
+const CIRCUIT_CONFIG = {
+  failureThreshold: 5,    // Open circuit after 5 consecutive failures
+  resetTimeMs: 60_000,    // Keep circuit open for 1 minute
+};
+
+let circuitState: SummarizationCircuitState = {
+  consecutiveFailures: 0,
+  circuitOpenUntil: null,
+  lastError: null,
+};
+
+let circuitRestored = false;
+
+/**
+ * Checks if the circuit breaker is open (blocking requests).
+ * Also restores state on first call if not already done.
+ */
+function isCircuitOpen(): boolean {
+  // Lazy restore on first check
+  if (!circuitRestored) {
+    restoreCircuitState();
+    circuitRestored = true;
+  }
+
+  if (!circuitState.circuitOpenUntil) return false;
+
+  if (Date.now() >= circuitState.circuitOpenUntil) {
+    // Reset circuit - allow retry
+    circuitState.circuitOpenUntil = null;
+    circuitState.consecutiveFailures = 0;
+    circuitState.lastError = null;
+    persistCircuitState();
+    logger.info('Summarization circuit breaker reset, allowing retries');
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Records a successful summarization, resetting the circuit breaker.
+ */
+function recordCircuitSuccess(): void {
+  if (circuitState.consecutiveFailures > 0) {
+    logger.debug('Summarization circuit success, resetting failure count');
+  }
+  circuitState.consecutiveFailures = 0;
+  circuitState.lastError = null;
+  if (circuitState.circuitOpenUntil !== null) {
+    circuitState.circuitOpenUntil = null;
+    persistCircuitState();
+  }
+}
+
+/**
+ * Records a summarization failure. Opens circuit if threshold exceeded.
+ */
+function recordCircuitFailure(error: string): void {
+  circuitState.consecutiveFailures++;
+  circuitState.lastError = error;
+
+  if (circuitState.consecutiveFailures >= CIRCUIT_CONFIG.failureThreshold) {
+    circuitState.circuitOpenUntil = Date.now() + CIRCUIT_CONFIG.resetTimeMs;
+    logger.warn('Summarization circuit breaker OPENED', {
+      failures: circuitState.consecutiveFailures,
+      resetAt: new Date(circuitState.circuitOpenUntil).toISOString(),
+      lastError: error,
+    });
+    persistCircuitState();
+  }
+}
+
+/**
+ * Persists circuit breaker state to SQLite (survives restarts).
+ */
+function persistCircuitState(): void {
+  try {
+    setSystemStateJson('summarization_circuit_breaker', {
+      consecutiveFailures: circuitState.consecutiveFailures,
+      circuitOpenUntil: circuitState.circuitOpenUntil,
+      lastError: circuitState.lastError,
+    });
+  } catch (error) {
+    logger.warn('Failed to persist summarization circuit state', {
+      error: error instanceof Error ? error.message : 'Unknown',
+    });
+  }
+}
+
+/**
+ * Restores circuit breaker state from SQLite on startup.
+ */
+function restoreCircuitState(): void {
+  try {
+    const persisted = getSystemStateJson<{
+      consecutiveFailures: number;
+      circuitOpenUntil: number | null;
+      lastError: string | null;
+    }>('summarization_circuit_breaker');
+
+    if (persisted) {
+      if (persisted.circuitOpenUntil && persisted.circuitOpenUntil > Date.now()) {
+        circuitState = {
+          consecutiveFailures: persisted.consecutiveFailures,
+          circuitOpenUntil: persisted.circuitOpenUntil,
+          lastError: persisted.lastError,
+        };
+        logger.info('Restored summarization circuit breaker state', {
+          failures: persisted.consecutiveFailures,
+          openUntil: new Date(persisted.circuitOpenUntil).toISOString(),
+        });
+      } else if (persisted.consecutiveFailures > 0) {
+        circuitState.consecutiveFailures = persisted.consecutiveFailures;
+        circuitState.lastError = persisted.lastError;
+        logger.debug('Restored summarization failure count (circuit expired)', {
+          failures: persisted.consecutiveFailures,
+        });
+      }
+    }
+  } catch (error) {
+    logger.warn('Failed to restore summarization circuit state', {
+      error: error instanceof Error ? error.message : 'Unknown',
+    });
+  }
+}
 
 /**
  * Formats messages for the summarization prompt.
@@ -93,6 +232,12 @@ export async function summarizeMessages(
       return;
     }
 
+    // Check circuit breaker first
+    if (isCircuitOpen()) {
+      logger.debug('Summarization circuit open, skipping');
+      return;
+    }
+
     // Check Ollama availability
     const availability = await checkOllamaAvailability();
     if (!availability.available) {
@@ -114,6 +259,7 @@ export async function summarizeMessages(
       logger.warn('Failed to parse JSON from summary response', {
         response: cleanedResponse.slice(0, 200),
       });
+      recordCircuitFailure('JSON parse error');
       return;
     }
 
@@ -121,6 +267,7 @@ export async function summarizeMessages(
     const validatedSummary = parseSummary(parsed, logger);
     if (!validatedSummary) {
       logger.warn('Invalid summary from LLM');
+      recordCircuitFailure('Schema validation error');
       return;
     }
 
@@ -139,8 +286,13 @@ export async function summarizeMessages(
       topic: summary.topic,
       points: summary.discussed.length,
     });
+
+    // Success - reset circuit breaker
+    recordCircuitSuccess();
   } catch (error) {
-    logger.error('Summarization failed', { error });
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    logger.error('Summarization failed', { error: message });
+    recordCircuitFailure(message);
   }
 }
 
@@ -213,15 +365,29 @@ function parseJsonArray(jsonStr: string): string[] {
 }
 
 /**
- * Gets summary statistics.
+ * Gets summary statistics including circuit breaker state.
  */
 export function getSummaryStats(): {
   count: number;
   maxSlots: number;
+  circuitBreaker: {
+    isOpen: boolean;
+    consecutiveFailures: number;
+    openUntil: string | null;
+    lastError: string | null;
+  };
 } {
   return {
     count: getSummaryCount(),
     maxSlots: 4,
+    circuitBreaker: {
+      isOpen: isCircuitOpen(),
+      consecutiveFailures: circuitState.consecutiveFailures,
+      openUntil: circuitState.circuitOpenUntil
+        ? new Date(circuitState.circuitOpenUntil).toISOString()
+        : null,
+      lastError: circuitState.lastError,
+    },
   };
 }
 
