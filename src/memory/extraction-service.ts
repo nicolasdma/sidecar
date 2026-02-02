@@ -500,9 +500,8 @@ export async function startExtractionWorker(): Promise<void> {
   if (availability.available) {
     logger.info('Starting extraction worker', { model: availability.model });
   } else {
-    logger.warn('Starting extraction worker (Ollama not yet available, will retry)', {
-      error: availability.error,
-    });
+    // INFO level since this is expected during startup - worker will retry automatically
+    logger.info('Starting extraction worker (Ollama not yet available, will retry)');
   }
 
   // Start the worker - it will periodically re-check Ollama

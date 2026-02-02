@@ -1310,10 +1310,9 @@ export function queueFactForEmbedding(factId: string): void {
     INSERT OR IGNORE INTO pending_embedding (fact_id)
     VALUES (?)
   `);
-  const result = stmt.run(factId);
-  if (result.changes > 0) {
-    logger.debug('Queued fact for embedding', { factId });
-  }
+  stmt.run(factId);
+  // Note: Individual queue DEBUG logs removed to reduce startup spam
+  // Caller (queueMissingEmbeddings) logs the total count
 }
 
 /**

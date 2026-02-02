@@ -32,7 +32,8 @@ function validateStartupRequirements(): string[] {
       warnings.push('user.md not found - using defaults');
     } else {
       const content = readFileSync(userMdPath, 'utf-8');
-      if (!content.includes('timezone:')) {
+      // Case-insensitive check for timezone (may be **Timezone**: in markdown)
+      if (!/timezone:/i.test(content)) {
         warnings.push('user.md missing timezone - proactive timing may be off');
       }
     }
@@ -77,10 +78,11 @@ async function logStartupStatus(
 
   // Status icons and labels
   const ollamaLabel = ollamaStatus.available ? '✓ Connected' : '✗ Offline';
+  // Embeddings: enabled means infrastructure ready (model loads lazily on first use)
   const embedLabel = embeddingsEnabled
-    ? state.ready
-      ? '✓ Active'
-      : '◐ Loading...'
+    ? state.reason === 'circuit_breaker'
+      ? '◐ Paused'
+      : '✓ Ready'
     : '✗ Disabled';
   const routerLabel = localRouterReady
     ? '✓ Ready'
